@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+#scimark specific:
+*.pdf
+*.md
+todo.txt
+resources/
+parsed/
