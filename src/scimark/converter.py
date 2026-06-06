@@ -119,6 +119,7 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
                     images_saved=pipeline_result.stats.images_saved,
                     picture_text_blocks_removed=pipeline_result.stats.picture_text_blocks_removed,
                     page_number_lines_removed=pipeline_result.stats.page_number_lines_removed,
+                    figure_caption_adjustments=pipeline_result.stats.figure_caption_adjustments,
                     tables_detected=pipeline_result.stats.tables_detected,
                     low_confidence_tables=pipeline_result.stats.low_confidence_tables,
                     low_confidence_math_regions=pipeline_result.stats.low_confidence_math_regions,

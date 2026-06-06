@@ -21,6 +21,8 @@ def write_report(
     skipped = [entry for entry in entries if entry.status == "skipped"]
     errored = [entry for entry in entries if entry.status == "error"]
 
+    all_table_stats = [table for entry in entries for table in entry.table_stats]
+
     payload = {
         "total_pdfs_discovered": total_pdfs_discovered,
         "pdfs_converted": len(converted),
@@ -31,8 +33,20 @@ def write_report(
             entry.picture_text_blocks_removed for entry in entries
         ),
         "total_page_number_lines_removed": sum(entry.page_number_lines_removed for entry in entries),
+        "total_figure_caption_adjustments": sum(
+            entry.figure_caption_adjustments for entry in entries
+        ),
         "total_markdown_tables_detected": sum(entry.tables_detected for entry in entries),
         "total_low_confidence_tables": sum(entry.low_confidence_tables for entry in entries),
+        "total_unusually_large_table_cells": sum(
+            table.unusually_large_cells for table in all_table_stats
+        ),
+        "total_repeated_stacked_values": sum(
+            table.repeated_stacked_values for table in all_table_stats
+        ),
+        "total_stacked_row_mismatches": sum(
+            table.stacked_row_mismatches for table in all_table_stats
+        ),
         "total_low_confidence_math_regions": sum(
             entry.low_confidence_math_regions for entry in entries
         ),

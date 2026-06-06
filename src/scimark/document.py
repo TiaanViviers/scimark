@@ -12,7 +12,12 @@ class TableStats:
     empty_cells: int
     empty_cell_ratio: float
     br_tag_count: int
+    unusually_large_cells: int
+    repeated_stacked_values: int
+    stacked_row_mismatches: int
+    max_stacked_segments: int
     low_confidence: bool
+    low_confidence_reasons: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -23,6 +28,7 @@ class DocumentStats:
     images_saved: int = 0
     picture_text_blocks_removed: int = 0
     page_number_lines_removed: int = 0
+    figure_caption_adjustments: int = 0
     tables_detected: int = 0
     low_confidence_tables: int = 0
     low_confidence_math_regions: int = 0
@@ -33,6 +39,7 @@ class DocumentStats:
             "images_saved": self.images_saved,
             "picture_text_blocks_removed": self.picture_text_blocks_removed,
             "page_number_lines_removed": self.page_number_lines_removed,
+            "figure_caption_adjustments": self.figure_caption_adjustments,
             "tables_detected": self.tables_detected,
             "low_confidence_tables": self.low_confidence_tables,
             "low_confidence_math_regions": self.low_confidence_math_regions,
@@ -50,6 +57,7 @@ class ManifestEntry:
     images_saved: int = 0
     picture_text_blocks_removed: int = 0
     page_number_lines_removed: int = 0
+    figure_caption_adjustments: int = 0
     tables_detected: int = 0
     low_confidence_tables: int = 0
     low_confidence_math_regions: int = 0

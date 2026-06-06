@@ -7,6 +7,9 @@ from scimark.document import TableStats
 
 
 SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+LARGE_CELL_CHAR_THRESHOLD = 80
+LARGE_CELL_SEGMENT_THRESHOLD = 4
 
 
 @dataclass(slots=True)
@@ -35,6 +38,15 @@ def _is_separator_line(line: str) -> bool:
 def _is_table_row(line: str) -> bool:
     stripped = line.strip()
     return bool(stripped) and "|" in stripped
+
+
+def _cell_segments(cell: str) -> list[str]:
+    segments = [segment.strip() for segment in BR_TAG_RE.split(cell) if segment.strip()]
+    if segments:
+        return segments
+    if cell.strip():
+        return [cell.strip()]
+    return []
 
 
 def find_tables(markdown: str) -> list[TableBlock]:
@@ -79,13 +91,51 @@ def analyze_table(lines: list[str]) -> TableStats:
     total_cells = sum(len(row) for row in content_rows)
     br_tag_count = sum(cell.lower().count("<br>") for row in content_rows for cell in row)
     empty_cell_ratio = empty_cells / total_cells if total_cells else 0.0
-    low_confidence = (
-        not consistent_columns
-        or empty_cell_ratio >= 0.35
-        or br_tag_count >= max(2, columns)
-        or (br_tag_count >= 2 and empty_cells > 0)
-        or columns <= 1
-    )
+    unusually_large_cells = 0
+    repeated_stacked_values = 0
+    stacked_row_mismatches = 0
+    max_stacked_segments = 0
+
+    for row in content_rows:
+        stacked_counts: list[int] = []
+
+        for cell in row:
+            segments = _cell_segments(cell)
+            segment_count = len(segments)
+            max_stacked_segments = max(max_stacked_segments, segment_count)
+
+            if segment_count >= LARGE_CELL_SEGMENT_THRESHOLD or len(cell.strip()) >= LARGE_CELL_CHAR_THRESHOLD:
+                unusually_large_cells += 1
+
+            if segment_count >= 3:
+                repeated_stacked_values += 1
+
+            if cell.strip():
+                if segment_count > 1:
+                    stacked_counts.append(segment_count)
+
+        if len(stacked_counts) >= 2 and len(set(stacked_counts)) > 1:
+            stacked_row_mismatches += 1
+
+    low_confidence_reasons: list[str] = []
+    if not consistent_columns:
+        low_confidence_reasons.append("inconsistent-columns")
+    if columns <= 1:
+        low_confidence_reasons.append("too-few-columns")
+    if empty_cell_ratio >= 0.35:
+        low_confidence_reasons.append("many-empty-cells")
+    if stacked_row_mismatches > 0:
+        low_confidence_reasons.append("stacked-row-mismatch")
+    if repeated_stacked_values > 0 and empty_cells > 0 and br_tag_count >= 2:
+        low_confidence_reasons.append("sparse-stacked-cells")
+    if repeated_stacked_values >= max(2, columns) and br_tag_count >= max(4, columns):
+        low_confidence_reasons.append("multi-value-cells")
+    if unusually_large_cells >= max(1, columns // 2) and repeated_stacked_values > 0:
+        low_confidence_reasons.append("large-cells")
+    if br_tag_count >= max(8, rows := len(content_rows)) and empty_cells > 0:
+        low_confidence_reasons.append("dense-br-layout")
+
+    low_confidence = bool(low_confidence_reasons)
 
     return TableStats(
         rows=len(content_rows),
@@ -94,7 +144,12 @@ def analyze_table(lines: list[str]) -> TableStats:
         empty_cells=empty_cells,
         empty_cell_ratio=round(empty_cell_ratio, 3),
         br_tag_count=br_tag_count,
+        unusually_large_cells=unusually_large_cells,
+        repeated_stacked_values=repeated_stacked_values,
+        stacked_row_mismatches=stacked_row_mismatches,
+        max_stacked_segments=max_stacked_segments,
         low_confidence=low_confidence,
+        low_confidence_reasons=low_confidence_reasons,
     )
 
 
