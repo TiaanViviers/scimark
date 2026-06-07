@@ -8,7 +8,9 @@ from pathlib import Path
 from scimark.document import ConversionSummary, ManifestEntry
 from scimark.fallbacks import (
     apply_algorithm_fallbacks,
+    apply_table_fallbacks,
     render_algorithm_region_fallbacks,
+    render_table_region_fallbacks,
     reorder_algorithm_pages,
 )
 from scimark.paths import discover_pdfs
@@ -134,12 +136,24 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
             )
 
             pipeline_result.stats.images_saved = _count_images(asset_dir)
-            pipeline_result.stats.fallback_assets_generated = render_algorithm_region_fallbacks(
+            pipeline_result.stats.fallback_assets_generated = render_table_region_fallbacks(
                 pdf_path,
                 fallback_dir,
-                raw_pages,
+                ordered_pages,
                 pipeline_result.stats.structural_candidates,
                 dpi=options.dpi,
+            )
+            pipeline_result.stats.fallback_assets_generated += render_algorithm_region_fallbacks(
+                pdf_path,
+                fallback_dir,
+                ordered_pages,
+                pipeline_result.stats.structural_candidates,
+                dpi=options.dpi,
+            )
+            pipeline_result.markdown = apply_table_fallbacks(
+                pipeline_result.markdown,
+                pipeline_result.stats.structural_candidates,
+                markdown_path,
             )
             pipeline_result.markdown = apply_algorithm_fallbacks(
                 pipeline_result.markdown,

@@ -8,6 +8,7 @@ from typing import Any
 
 from scimark.document import StructuralCandidate
 from scimark.passes.algorithms import find_algorithm_regions
+from scimark.passes.tables import analyze_table, find_tables
 from scimark.pipeline import PageMarkdown
 
 
@@ -18,6 +19,7 @@ BODY_MARKER_RE = re.compile(
 VISUAL_BOX_CLASSES = {"formula", "picture"}
 TEXTUAL_BOX_CLASSES = {"text", "caption", "section-header", "list-item"}
 PADDING = 12
+LOW_CONFIDENCE_TABLE_NOTE = "> Low confidence table detected. Cropped fallback image included below for safety."
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -109,6 +111,24 @@ def _algorithm_crop_box(
     prioritized = [box for box in overlapping if box.get("class") in TEXTUAL_BOX_CLASSES]
     selected = prioritized or overlapping
     selected = _expand_with_adjacent_visual_box(page.page_boxes, selected)
+    return _union_bbox(selected)
+
+
+def _table_crop_box(page: PageMarkdown, table_index: int) -> tuple[float, float, float, float] | None:
+    source_text = page.raw_markdown or page.markdown
+    raw_tables = find_tables(source_text)
+    low_conf_tables = [table for table in raw_tables if analyze_table(table.lines).low_confidence]
+    if table_index >= len(low_conf_tables):
+        return None
+
+    table = low_conf_tables[table_index]
+    start, end = _region_char_span(source_text, table.start_line, table.end_line)
+    overlapping = _boxes_overlapping_span(page.page_boxes, start, end)
+    if not overlapping:
+        return None
+
+    table_boxes = [box for box in overlapping if box.get("class") == "table"]
+    selected = table_boxes or overlapping
     return _union_bbox(selected)
 
 
@@ -251,6 +271,63 @@ def render_algorithm_region_fallbacks(
     return len(rendered_paths)
 
 
+def render_table_region_fallbacks(
+    pdf_path: Path,
+    fallback_dir: Path,
+    pages: list[PageMarkdown],
+    candidates: list[StructuralCandidate],
+    *,
+    dpi: int,
+) -> int:
+    table_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.kind == "table" and candidate.needs_fallback and candidate.source_page is not None
+    ]
+    if not table_candidates:
+        return 0
+
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise RuntimeError("PyMuPDF is not installed in the active environment.") from exc
+
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    matrix = pymupdf.Matrix(dpi / 72, dpi / 72)
+    pages_by_number = {page.page_number: page for page in pages}
+    rendered_paths: set[Path] = set()
+
+    with pymupdf.open(pdf_path) as document:
+        grouped: dict[int, list[StructuralCandidate]] = {}
+        for candidate in table_candidates:
+            assert candidate.source_page is not None
+            grouped.setdefault(candidate.source_page, []).append(candidate)
+
+        for page_number, page_candidates in grouped.items():
+            page = document.load_page(page_number - 1)
+            page_chunk = pages_by_number.get(page_number)
+            ordered_candidates = sorted(page_candidates, key=lambda candidate: candidate.start_line)
+
+            for table_index, candidate in enumerate(ordered_candidates):
+                clip = _table_crop_box(page_chunk, table_index) if page_chunk is not None else None
+
+                if clip is None:
+                    clip_rect = page.rect
+                    output_name = f"page-{page_number:04d}.png"
+                else:
+                    clip_rect = pymupdf.Rect(*clip) + (-PADDING, -PADDING, PADDING, PADDING)
+                    clip_rect = clip_rect & page.rect
+                    output_name = f"{candidate.block_id}.png"
+
+                output_path = fallback_dir / output_name
+                if output_path not in rendered_paths:
+                    page.get_pixmap(matrix=matrix, alpha=False, clip=clip_rect).save(output_path)
+                    rendered_paths.add(output_path)
+                candidate.fallback_asset_path = str(output_path.resolve())
+
+    return len(rendered_paths)
+
+
 def _extract_algorithm_heading(region_text: str, candidate: StructuralCandidate) -> str:
     for line in region_text.splitlines():
         if "Algorithm" not in line:
@@ -315,3 +392,52 @@ def apply_algorithm_fallbacks(
 
     output_lines.extend(lines[cursor:])
     return "\n".join(output_lines).rstrip() + "\n"
+
+
+def apply_table_fallbacks(
+    markdown: str,
+    candidates: list[StructuralCandidate],
+    markdown_path: Path,
+) -> str:
+    low_confidence_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.kind == "table" and candidate.needs_fallback and candidate.fallback_asset_path
+    ]
+    if not low_confidence_candidates:
+        return markdown
+
+    tables = find_tables(markdown)
+    if not tables:
+        return markdown
+
+    low_confidence_tables = [
+        table for table in tables if analyze_table(table.lines).low_confidence
+    ]
+    lines = markdown.splitlines()
+    output_lines: list[str] = []
+    cursor = 0
+
+    for table, candidate in zip(low_confidence_tables, low_confidence_candidates, strict=False):
+        replace_start = table.start_line
+        while replace_start > 0 and lines[replace_start - 1].strip() == "<!-- scimark: low-confidence-table -->":
+            replace_start -= 1
+
+        output_lines.extend(lines[cursor:replace_start])
+        output_lines.extend(table.lines)
+        relative_path = Path(candidate.fallback_asset_path).relative_to(
+            markdown_path.parent.resolve()
+        ).as_posix()
+        output_lines.extend(
+            [
+                "",
+                LOW_CONFIDENCE_TABLE_NOTE,
+                "",
+                f"![]({relative_path})",
+            ]
+        )
+        cursor = table.end_line + 1
+
+    output_lines.extend(lines[cursor:])
+    return "\n".join(output_lines).rstrip() + "\n"
+

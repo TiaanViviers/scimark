@@ -5,7 +5,9 @@ import pymupdf
 from scimark.document import StructuralCandidate
 from scimark.fallbacks import (
     apply_algorithm_fallbacks,
+    apply_table_fallbacks,
     render_algorithm_region_fallbacks,
+    render_table_region_fallbacks,
     reorder_algorithm_pages,
 )
 from scimark.pipeline import PageMarkdown
@@ -106,6 +108,99 @@ After text.
     assert "_assets/paper/algorithm-2.png" not in rewritten
     assert "**Algorithm 2:** Approximate Algorithm for Split Finding" in rewritten
     assert "![](_fallbacks/paper/page-0003.png)" in rewritten
+
+
+def test_render_table_region_fallbacks_renders_low_confidence_table_crop(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    document = pymupdf.open()
+    document.new_page()
+    document.save(pdf_path)
+    document.close()
+
+    markdown = """Table 2: Scores
+
+| Metric | Value |
+| --- | --- |
+| Accuracy |  |
+| Recall | bad<br>split<br>cell |
+"""
+    table_start = markdown.index("| Metric | Value |")
+    table_end = len(markdown)
+    page = PageMarkdown(
+        page_number=1,
+        raw_markdown=markdown,
+        markdown=markdown,
+        page_boxes=[
+            {"index": 0, "class": "caption", "bbox": (50, 50, 250, 80), "pos": (0, table_start)},
+            {"index": 1, "class": "table", "bbox": (50, 90, 280, 180), "pos": (table_start, table_end)},
+        ],
+    )
+
+    candidates = [
+        StructuralCandidate(
+            block_id="table-2",
+            kind="table",
+            start_line=2,
+            end_line=5,
+            source_page=1,
+            label="Table 2",
+            needs_fallback=True,
+        )
+    ]
+
+    count = render_table_region_fallbacks(
+        pdf_path,
+        tmp_path / "fallbacks",
+        [page],
+        candidates,
+        dpi=72,
+    )
+
+    assert count == 1
+    assert candidates[0].fallback_asset_path is not None
+    assert Path(candidates[0].fallback_asset_path).exists()
+
+
+def test_apply_table_fallbacks_keeps_table_and_adds_visible_note_and_image(
+    tmp_path: Path,
+) -> None:
+    markdown_path = tmp_path / "paper.md"
+    fallback_path = tmp_path / "_fallbacks" / "paper" / "table-2.png"
+    fallback_path.parent.mkdir(parents=True, exist_ok=True)
+    fallback_path.write_bytes(b"png")
+
+    markdown = """Table 2: Scores
+
+<!-- scimark: low-confidence-table -->
+| Metric | Value |
+| --- | --- |
+| Accuracy |  |
+| Recall | bad<br>split<br>cell |
+
+After text.
+"""
+    candidates = [
+        StructuralCandidate(
+            block_id="table-2",
+            kind="table",
+            start_line=2,
+            end_line=5,
+            source_page=1,
+            label="Table 2",
+            needs_fallback=True,
+            fallback_asset_path=str(fallback_path.resolve()),
+        )
+    ]
+
+    rewritten = apply_table_fallbacks(markdown, candidates, markdown_path)
+
+    assert "<!-- scimark: low-confidence-table -->" not in rewritten
+    assert "| Metric | Value |" in rewritten
+    assert "Low confidence table detected" in rewritten
+    assert "![](_fallbacks/paper/table-2.png)" in rewritten
+
 
 
 def test_reorder_algorithm_pages_moves_right_column_algorithm_after_later_left_column_text() -> None:

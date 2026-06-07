@@ -33,6 +33,10 @@ def _is_suspicious_math_paragraph(block: str) -> bool:
     )
 
 
+def is_suspicious_math_paragraph(block: str) -> bool:
+    return _is_suspicious_math_paragraph(block)
+
+
 def _is_existing_confidence_comment(block: MarkdownBlock) -> bool:
     return block.block_type == "unknown" and block.text.strip() == COMMENT
 

@@ -65,7 +65,6 @@ def renumber_structural_candidates(candidates: list[StructuralCandidate]) -> Non
         elif candidate.kind == "algorithm" and not candidate.label:
             candidate.label = f"Algorithm {index}"
 
-
 def finalize_document_stats(stats: DocumentStats) -> None:
     stats.tables_detected = len(stats.table_stats)
     stats.low_confidence_tables = sum(1 for table in stats.table_stats if table.low_confidence)
