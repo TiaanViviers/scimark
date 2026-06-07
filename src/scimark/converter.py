@@ -7,7 +7,7 @@ from pathlib import Path
 
 from scimark.document import ConversionSummary, ManifestEntry
 from scimark.paths import discover_pdfs
-from scimark.pipeline import PipelineOptions, run_pipeline
+from scimark.pipeline import PageMarkdown, PipelineOptions, run_pipeline_pages
 from scimark.report import write_manifest, write_report
 
 
@@ -21,19 +21,28 @@ class ConvertOptions:
     keep_raw: bool = False
 
 
-def _render_pdf_to_markdown(pdf_path: Path, asset_dir: Path, dpi: int) -> str:
+def _render_pdf_to_markdown_pages(pdf_path: Path, asset_dir: Path, dpi: int) -> list[PageMarkdown]:
     try:
         import pymupdf4llm
     except ImportError as exc:
         raise RuntimeError("pymupdf4llm is not installed in the active environment.") from exc
 
-    return pymupdf4llm.to_markdown(
+    chunks = pymupdf4llm.to_markdown(
         str(pdf_path),
+        page_chunks=True,
         write_images=True,
         image_path=str(asset_dir),
         image_format="png",
         image_dpi=dpi,
     )
+
+    pages: list[PageMarkdown] = []
+    for page_index, chunk in enumerate(chunks, start=1):
+        metadata = dict(chunk.get("metadata", {}))
+        page_number = int(metadata.get("page_number", page_index))
+        pages.append(PageMarkdown(page_number=page_number, markdown=chunk.get("text", "")))
+
+    return pages
 
 
 def _count_images(asset_dir: Path) -> int:
@@ -92,13 +101,14 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
 
             asset_dir.mkdir(parents=True, exist_ok=True)
 
-            raw_markdown = _render_pdf_to_markdown(pdf_path, asset_dir, options.dpi)
+            raw_pages = _render_pdf_to_markdown_pages(pdf_path, asset_dir, options.dpi)
+            raw_markdown = "\n\n".join(page.markdown.rstrip("\n") for page in raw_pages).rstrip() + "\n"
             if options.keep_raw:
                 raw_root.mkdir(parents=True, exist_ok=True)
                 raw_markdown_path.write_text(raw_markdown, encoding="utf-8")
 
-            pipeline_result = run_pipeline(
-                raw_markdown,
+            pipeline_result = run_pipeline_pages(
+                raw_pages,
                 PipelineOptions(
                     pdf_stem=pdf_path.stem,
                     strip_picture_text=options.strip_picture_text,
@@ -121,10 +131,12 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
                     page_number_lines_removed=pipeline_result.stats.page_number_lines_removed,
                     figure_caption_adjustments=pipeline_result.stats.figure_caption_adjustments,
                     tables_detected=pipeline_result.stats.tables_detected,
+                    algorithm_blocks_detected=pipeline_result.stats.algorithm_blocks_detected,
                     low_confidence_tables=pipeline_result.stats.low_confidence_tables,
                     low_confidence_math_regions=pipeline_result.stats.low_confidence_math_regions,
                     processing_time_seconds=round(elapsed, 3),
                     table_stats=pipeline_result.stats.table_stats,
+                    structural_candidates=pipeline_result.stats.structural_candidates,
                 )
             )
         except Exception as exc:

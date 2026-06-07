@@ -2,66 +2,61 @@ from __future__ import annotations
 
 import re
 
+from scimark.markdown_blocks import MarkdownBlock, parse_markdown_blocks
 
-IMAGE_LINE_RE = re.compile(r"^\s*!\[[^\]]*]\([^)]+\)\s*$")
+
 CAPTION_LINE_RE = re.compile(r"^\s*(?:Figure|Fig\.?)\s+\d+\s*[:.].*")
 SCIMARK_COMMENT_RE = re.compile(r"^\s*<!--\s*scimark:.*?-->\s*$")
 
 
-def _is_blank(line: str) -> bool:
-    return not line.strip()
-
-
-def _is_comment(line: str) -> bool:
+def _is_comment_line(line: str) -> bool:
     return bool(SCIMARK_COMMENT_RE.fullmatch(line))
 
 
-def _is_image(line: str) -> bool:
-    return bool(IMAGE_LINE_RE.fullmatch(line))
+def _is_caption_block(block: MarkdownBlock) -> bool:
+    return (
+        block.block_type == "paragraph"
+        and len(block.lines) == 1
+        and bool(CAPTION_LINE_RE.fullmatch(block.lines[0]))
+    )
 
 
-def _is_caption(line: str) -> bool:
-    return bool(CAPTION_LINE_RE.fullmatch(line))
+def _is_comment_block(block: MarkdownBlock) -> bool:
+    return block.block_type == "unknown" and all(_is_comment_line(line) for line in block.lines)
 
 
-def _is_ignorable(line: str) -> bool:
-    return _is_blank(line) or _is_comment(line)
+def _is_figure_neighbor_block(block: MarkdownBlock) -> bool:
+    return block.block_type == "image" or _is_comment_block(block)
 
 
-def _normalize_figure_block(block_lines: list[str], caption_line: str) -> list[str]:
-    normalized = [line for line in block_lines if not _is_blank(line)]
-    normalized.append(caption_line)
-    return normalized
-
-
-def _find_nearby_image_block_before(lines: list[str], caption_index: int) -> tuple[int, int] | None:
+def _find_nearby_figure_blocks_before(
+    blocks: list[MarkdownBlock], caption_index: int
+) -> tuple[int, int] | None:
     index = caption_index - 1
     if index < 0:
         return None
 
     seen_image = False
-    while index >= 0 and (_is_ignorable(lines[index]) or _is_image(lines[index])):
-        seen_image = seen_image or _is_image(lines[index])
+    while index >= 0 and _is_figure_neighbor_block(blocks[index]):
+        seen_image = seen_image or blocks[index].block_type == "image"
         index -= 1
 
     if not seen_image:
         return None
 
-    block_start = index + 1
-    while block_start < caption_index and _is_blank(lines[block_start]):
-        block_start += 1
-
-    return block_start, caption_index
+    return index + 1, caption_index
 
 
-def _find_nearby_image_block_after(lines: list[str], caption_index: int) -> tuple[int, int] | None:
+def _find_nearby_figure_blocks_after(
+    blocks: list[MarkdownBlock], caption_index: int
+) -> tuple[int, int] | None:
     index = caption_index + 1
-    if index >= len(lines):
+    if index >= len(blocks):
         return None
 
     seen_image = False
-    while index < len(lines) and (_is_ignorable(lines[index]) or _is_image(lines[index])):
-        seen_image = seen_image or _is_image(lines[index])
+    while index < len(blocks) and _is_figure_neighbor_block(blocks[index]):
+        seen_image = seen_image or blocks[index].block_type == "image"
         index += 1
 
     if not seen_image:
@@ -70,42 +65,54 @@ def _find_nearby_image_block_after(lines: list[str], caption_index: int) -> tupl
     return caption_index, index - 1
 
 
+def _normalized_figure_block_lines(blocks: list[MarkdownBlock], caption_line: str) -> list[str]:
+    normalized: list[str] = []
+    for block in blocks:
+        normalized.extend(block.lines)
+    normalized.append(caption_line)
+    return normalized
+
+
 def keep_captions_with_figures(markdown: str) -> tuple[str, int]:
     lines = markdown.splitlines()
     if not lines:
         return markdown, 0
 
     adjusted = 0
-    index = 0
+    changed = True
 
-    while index < len(lines):
-        if not _is_caption(lines[index]):
-            index += 1
-            continue
+    while changed:
+        changed = False
+        blocks = parse_markdown_blocks("\n".join(lines))
 
-        before_block = _find_nearby_image_block_before(lines, index)
-        if before_block is not None:
-            block_start, caption_index = before_block
-            block_lines = lines[block_start:caption_index]
-            normalized = _normalize_figure_block(block_lines, lines[caption_index])
-            if normalized != lines[block_start : caption_index + 1]:
-                lines[block_start : caption_index + 1] = normalized
-                adjusted += 1
-            index = block_start + len(normalized)
-            continue
+        for block_index, block in enumerate(blocks):
+            if not _is_caption_block(block):
+                continue
 
-        after_block = _find_nearby_image_block_after(lines, index)
-        if after_block is not None:
-            caption_index, block_end = after_block
-            block_lines = lines[caption_index + 1 : block_end + 1]
-            normalized = _normalize_figure_block(block_lines, lines[caption_index])
-            replacement = normalized
-            if replacement != lines[caption_index : block_end + 1]:
-                lines[caption_index : block_end + 1] = replacement
-                adjusted += 1
-            index = caption_index + len(replacement)
-            continue
+            before_group = _find_nearby_figure_blocks_before(blocks, block_index)
+            if before_group is not None:
+                start_index, caption_index = before_group
+                group_blocks = blocks[start_index:caption_index]
+                normalized = _normalized_figure_block_lines(group_blocks, block.lines[0])
+                slice_start = blocks[start_index].start_line
+                slice_end = block.end_line + 1
+                if normalized != lines[slice_start:slice_end]:
+                    lines[slice_start:slice_end] = normalized
+                    adjusted += 1
+                    changed = True
+                    break
 
-        index += 1
+            after_group = _find_nearby_figure_blocks_after(blocks, block_index)
+            if after_group is not None:
+                caption_index, end_index = after_group
+                group_blocks = blocks[caption_index + 1 : end_index + 1]
+                normalized = _normalized_figure_block_lines(group_blocks, block.lines[0])
+                slice_start = block.start_line
+                slice_end = blocks[end_index].end_line + 1
+                if normalized != lines[slice_start:slice_end]:
+                    lines[slice_start:slice_end] = normalized
+                    adjusted += 1
+                    changed = True
+                    break
 
     return "\n".join(lines).rstrip() + "\n", adjusted

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from scimark.markdown_blocks import MarkdownBlock, parse_markdown_blocks
+
 
 COMMENT = "<!-- scimark: low-confidence-math -->"
 PATTERNS = [
@@ -13,11 +15,6 @@ PATTERNS = [
     r"_D\[\+\]",
     r"_rD\[−\]",
 ]
-
-
-def _looks_like_table(block: str) -> bool:
-    lines = [line for line in block.splitlines() if line.strip()]
-    return len(lines) >= 2 and "|" in lines[0] and "|" in lines[1]
 
 
 def _is_suspicious_math_paragraph(block: str) -> bool:
@@ -36,24 +33,31 @@ def _is_suspicious_math_paragraph(block: str) -> bool:
     )
 
 
+def _is_existing_confidence_comment(block: MarkdownBlock) -> bool:
+    return block.block_type == "unknown" and block.text.strip() == COMMENT
+
+
 def annotate_low_confidence_math(markdown: str) -> tuple[str, int]:
-    blocks = re.split(r"\n\s*\n", markdown.strip())
-    annotated_blocks: list[str] = []
-    count = 0
+    lines = markdown.splitlines()
+    if not lines:
+        return markdown, 0
 
-    for block in blocks:
-        stripped = block.strip()
-        if not stripped:
+    blocks = parse_markdown_blocks(markdown)
+    insertion_points: list[int] = []
+
+    for block_index, block in enumerate(blocks):
+        if block.block_type != "paragraph":
             continue
 
-        if stripped.startswith("```") or stripped.startswith("~~~") or _looks_like_table(stripped):
-            annotated_blocks.append(block)
+        if not _is_suspicious_math_paragraph(block.text):
             continue
 
-        if _is_suspicious_math_paragraph(stripped):
-            annotated_blocks.append(f"{COMMENT}\n{block}")
-            count += 1
-        else:
-            annotated_blocks.append(block)
+        if block_index > 0 and _is_existing_confidence_comment(blocks[block_index - 1]):
+            continue
 
-    return "\n\n".join(annotated_blocks).rstrip() + "\n", count
+        insertion_points.append(block.start_line)
+
+    for offset, line_index in enumerate(insertion_points):
+        lines.insert(line_index + offset, COMMENT)
+
+    return "\n".join(lines).rstrip() + "\n", len(insertion_points)

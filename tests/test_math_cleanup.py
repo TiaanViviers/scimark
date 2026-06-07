@@ -112,3 +112,34 @@ The update uses _[ x _D[+] 1 ] with [+] and [−] terms that look broken.
 
     assert count == 1
     assert "<!-- scimark: low-confidence-math -->" in annotated
+
+
+def test_annotate_low_confidence_math_only_flags_paragraph_blocks() -> None:
+    markdown = """The update uses _[ x _D[+] 1 ] with [+] and [−] terms that look broken.
+
+|expr|value|
+|---|---|
+|_[x]|[+]|
+
+```text
+_[ x _D[+] 1 ] with [+] and [−] terms that look broken.
+```
+"""
+
+    annotated, count = annotate_low_confidence_math(markdown)
+
+    assert count == 1
+    assert annotated.count("<!-- scimark: low-confidence-math -->") == 1
+    assert "|_[x]|[+]|" in annotated
+    assert "```text" in annotated
+
+
+def test_annotate_low_confidence_math_does_not_duplicate_existing_comment() -> None:
+    markdown = """<!-- scimark: low-confidence-math -->
+The update uses _[ x _D[+] 1 ] with [+] and [−] terms that look broken.
+"""
+
+    annotated, count = annotate_low_confidence_math(markdown)
+
+    assert count == 0
+    assert annotated.count("<!-- scimark: low-confidence-math -->") == 1

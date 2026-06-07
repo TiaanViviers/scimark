@@ -22,6 +22,9 @@ def write_report(
     errored = [entry for entry in entries if entry.status == "error"]
 
     all_table_stats = [table for entry in entries for table in entry.table_stats]
+    all_structural_candidates = [
+        candidate for entry in entries for candidate in entry.structural_candidates
+    ]
 
     payload = {
         "total_pdfs_discovered": total_pdfs_discovered,
@@ -37,6 +40,9 @@ def write_report(
             entry.figure_caption_adjustments for entry in entries
         ),
         "total_markdown_tables_detected": sum(entry.tables_detected for entry in entries),
+        "total_algorithm_blocks_detected": sum(
+            entry.algorithm_blocks_detected for entry in entries
+        ),
         "total_low_confidence_tables": sum(entry.low_confidence_tables for entry in entries),
         "total_unusually_large_table_cells": sum(
             table.unusually_large_cells for table in all_table_stats
@@ -49,6 +55,10 @@ def write_report(
         ),
         "total_low_confidence_math_regions": sum(
             entry.low_confidence_math_regions for entry in entries
+        ),
+        "total_structural_candidates": len(all_structural_candidates),
+        "total_structural_fallback_candidates": sum(
+            1 for candidate in all_structural_candidates if candidate.needs_fallback
         ),
         "total_processing_time_seconds": round(total_processing_time_seconds, 3),
     }
