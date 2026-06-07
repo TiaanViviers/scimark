@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 
 from scimark.document import TableStats
+from scimark.markdown_blocks import parse_markdown_blocks
 
 
 SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
@@ -50,35 +51,11 @@ def _cell_segments(cell: str) -> list[str]:
 
 
 def find_tables(markdown: str) -> list[TableBlock]:
-    lines = markdown.splitlines()
-    tables: list[TableBlock] = []
-    in_code_fence = False
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_code_fence = not in_code_fence
-            index += 1
-            continue
-
-        if in_code_fence or index + 1 >= len(lines):
-            index += 1
-            continue
-
-        if _is_table_row(line) and _is_separator_line(lines[index + 1]):
-            end = index + 2
-            while end < len(lines) and _is_table_row(lines[end]):
-                end += 1
-            tables.append(TableBlock(start_line=index, end_line=end - 1, lines=lines[index:end]))
-            index = end
-            continue
-
-        index += 1
-
-    return tables
+    return [
+        TableBlock(start_line=block.start_line, end_line=block.end_line, lines=block.lines)
+        for block in parse_markdown_blocks(markdown)
+        if block.block_type == "table"
+    ]
 
 
 def analyze_table(lines: list[str]) -> TableStats:
