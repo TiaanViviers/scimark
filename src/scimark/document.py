@@ -33,6 +33,7 @@ class StructuralCandidate:
     label: str | None = None
     low_confidence: bool = False
     needs_fallback: bool = False
+    fallback_asset_path: str | None = None
     reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +43,7 @@ class StructuralCandidate:
 @dataclass(slots=True)
 class DocumentStats:
     images_saved: int = 0
+    fallback_assets_generated: int = 0
     picture_text_blocks_removed: int = 0
     page_number_lines_removed: int = 0
     figure_caption_adjustments: int = 0
@@ -55,6 +57,7 @@ class DocumentStats:
     def to_summary_dict(self) -> dict[str, Any]:
         return {
             "images_saved": self.images_saved,
+            "fallback_assets_generated": self.fallback_assets_generated,
             "picture_text_blocks_removed": self.picture_text_blocks_removed,
             "page_number_lines_removed": self.page_number_lines_removed,
             "figure_caption_adjustments": self.figure_caption_adjustments,
@@ -75,6 +78,7 @@ class ManifestEntry:
     status: str
     reason: str | None = None
     images_saved: int = 0
+    fallback_assets_generated: int = 0
     picture_text_blocks_removed: int = 0
     page_number_lines_removed: int = 0
     figure_caption_adjustments: int = 0

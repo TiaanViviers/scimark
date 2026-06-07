@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from scimark.document import DocumentStats
 from scimark.passes.algorithms import annotate_algorithm_blocks
@@ -29,6 +30,8 @@ class PipelineOptions:
 class PageMarkdown:
     page_number: int
     markdown: str
+    raw_markdown: str = ""
+    page_boxes: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

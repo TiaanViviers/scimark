@@ -32,6 +32,7 @@ def write_report(
         "pdfs_skipped": len(skipped),
         "pdfs_errored": len(errored),
         "total_images_saved": sum(entry.images_saved for entry in entries),
+        "total_fallback_assets_generated": sum(entry.fallback_assets_generated for entry in entries),
         "total_picture_text_blocks_removed": sum(
             entry.picture_text_blocks_removed for entry in entries
         ),

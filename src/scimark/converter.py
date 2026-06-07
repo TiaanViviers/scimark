@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scimark.document import ConversionSummary, ManifestEntry
+from scimark.fallbacks import (
+    apply_algorithm_fallbacks,
+    render_algorithm_region_fallbacks,
+    reorder_algorithm_pages,
+)
 from scimark.paths import discover_pdfs
 from scimark.pipeline import PageMarkdown, PipelineOptions, run_pipeline_pages
 from scimark.report import write_manifest, write_report
@@ -40,7 +45,14 @@ def _render_pdf_to_markdown_pages(pdf_path: Path, asset_dir: Path, dpi: int) -> 
     for page_index, chunk in enumerate(chunks, start=1):
         metadata = dict(chunk.get("metadata", {}))
         page_number = int(metadata.get("page_number", page_index))
-        pages.append(PageMarkdown(page_number=page_number, markdown=chunk.get("text", "")))
+        pages.append(
+            PageMarkdown(
+                page_number=page_number,
+                markdown=chunk.get("text", ""),
+                raw_markdown=chunk.get("text", ""),
+                page_boxes=list(chunk.get("page_boxes", [])),
+            )
+        )
 
     return pages
 
@@ -54,6 +66,7 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
     output_dir.mkdir(parents=True, exist_ok=True)
 
     assets_root = output_dir / "_assets"
+    fallbacks_root = output_dir / "_fallbacks"
     metadata_root = output_dir / "_scimark"
     metadata_root.mkdir(parents=True, exist_ok=True)
     raw_root = metadata_root / "raw"
@@ -65,6 +78,7 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
     for pdf_path in discovered_pdfs:
         markdown_path = output_dir / f"{pdf_path.stem}.md"
         asset_dir = assets_root / pdf_path.stem
+        fallback_dir = fallbacks_root / pdf_path.stem
         raw_markdown_path = raw_root / f"{pdf_path.stem}.md"
 
         if markdown_path in reserved_outputs:
@@ -98,6 +112,8 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
         try:
             if asset_dir.exists() and options.overwrite:
                 shutil.rmtree(asset_dir)
+            if fallback_dir.exists() and options.overwrite:
+                shutil.rmtree(fallback_dir)
 
             asset_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,8 +123,9 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
                 raw_root.mkdir(parents=True, exist_ok=True)
                 raw_markdown_path.write_text(raw_markdown, encoding="utf-8")
 
+            ordered_pages = reorder_algorithm_pages(raw_pages)
             pipeline_result = run_pipeline_pages(
-                raw_pages,
+                ordered_pages,
                 PipelineOptions(
                     pdf_stem=pdf_path.stem,
                     strip_picture_text=options.strip_picture_text,
@@ -116,8 +133,20 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
                 ),
             )
 
-            markdown_path.write_text(pipeline_result.markdown, encoding="utf-8")
             pipeline_result.stats.images_saved = _count_images(asset_dir)
+            pipeline_result.stats.fallback_assets_generated = render_algorithm_region_fallbacks(
+                pdf_path,
+                fallback_dir,
+                raw_pages,
+                pipeline_result.stats.structural_candidates,
+                dpi=options.dpi,
+            )
+            pipeline_result.markdown = apply_algorithm_fallbacks(
+                pipeline_result.markdown,
+                pipeline_result.stats.structural_candidates,
+                markdown_path,
+            )
+            markdown_path.write_text(pipeline_result.markdown, encoding="utf-8")
             elapsed = time.perf_counter() - started
 
             manifest_entries.append(
@@ -127,6 +156,7 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
                     asset_dir=str(asset_dir.resolve()),
                     status="converted",
                     images_saved=pipeline_result.stats.images_saved,
+                    fallback_assets_generated=pipeline_result.stats.fallback_assets_generated,
                     picture_text_blocks_removed=pipeline_result.stats.picture_text_blocks_removed,
                     page_number_lines_removed=pipeline_result.stats.page_number_lines_removed,
                     figure_caption_adjustments=pipeline_result.stats.figure_caption_adjustments,
