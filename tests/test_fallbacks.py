@@ -110,6 +110,58 @@ After text.
     assert "![](_fallbacks/paper/page-0003.png)" in rewritten
 
 
+def test_apply_algorithm_fallbacks_matches_candidates_by_label_not_zip_order(
+    tmp_path: Path,
+) -> None:
+    markdown_path = tmp_path / "paper.md"
+    fallback_dir = tmp_path / "_fallbacks" / "paper"
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    path3 = fallback_dir / "algorithm-3.png"
+    path4 = fallback_dir / "algorithm-4.png"
+    path3.write_bytes(b"png")
+    path4.write_bytes(b"png")
+
+    markdown = """Algorithm 3: Sparsity-aware Split Finding
+
+Body text.
+
+Algorithm 2:
+
+Algorithm 4: Query Function g(Q, d)
+
+More body text.
+"""
+    candidates = [
+        StructuralCandidate(
+            block_id="algorithm-3",
+            kind="algorithm",
+            start_line=0,
+            end_line=2,
+            source_page=5,
+            label="Algorithm 3",
+            needs_fallback=True,
+            fallback_asset_path=str(path3.resolve()),
+        ),
+        StructuralCandidate(
+            block_id="algorithm-4",
+            kind="algorithm",
+            start_line=5,
+            end_line=7,
+            source_page=12,
+            label="Algorithm 4",
+            needs_fallback=True,
+            fallback_asset_path=str(path4.resolve()),
+        ),
+    ]
+
+    rewritten = apply_algorithm_fallbacks(markdown, candidates, markdown_path)
+
+    assert "Algorithm 3: Sparsity-aware Split Finding" in rewritten
+    assert "Algorithm 4: Query Function g(Q, d)" in rewritten
+    assert "![](_fallbacks/paper/algorithm-3.png)" in rewritten
+    assert "![](_fallbacks/paper/algorithm-4.png)" in rewritten
+
+
 def test_render_table_region_fallbacks_renders_low_confidence_table_crop(
     tmp_path: Path,
 ) -> None:

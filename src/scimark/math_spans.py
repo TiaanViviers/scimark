@@ -27,15 +27,33 @@ MATH_STATEMENT_RE = re.compile(
     r"∈|≤|≥|≈|→"
     r")"
 )
+AFFILIATION_RE = re.compile(
+    r"\b(?:university|department|school|research|institute|laboratory|lab|corporation|company|college)\b",
+    re.IGNORECASE,
+)
+EMAIL_OR_URL_RE = re.compile(r"(?:@|https?://|www\.)", re.IGNORECASE)
+CAPITALIZED_WORD_RE = re.compile(r"\b[A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?\b")
+STRONG_MATH_RELATION_RE = re.compile(
+    r"(?:=|≤|≥|≈|∈|→|√|[+*/]|(?<=[A-Za-z0-9)\]}ωϵλγΣΠα-ωΑ-Ω˜])-(?=[A-Za-z0-9ωϵλγΣΠα-ωΑ-Ω˜]))"
+)
+BIBLIOGRAPHY_RE = re.compile(
+    r"(?:\bet al\.\b|\barXiv\b|\bpp\.\b|\bIn:\b|\bProceedings\b|\bConference\b|\bJournal\b|\bISBN\b|\bDOI\b)",
+    re.IGNORECASE,
+)
 SCRIPT_CLUSTER_RE = re.compile(r"^[A-Za-z0-9α-ωΑ-ΩϵωλγΣΠ_]+(?:[+\-][A-Za-z0-9α-ωΑ-ΩϵωλγΣΠ_]+)*$")
 REGION_PROSE_BOX_CLASSES = {"text", "list-item", "section-header"}
 FORMULA_PLACEHOLDER = "[[FORMULA_BOX]]"
-SURFACE_REPLACEMENTS = (
+#
+# Generic replacements fix broad parser boundary failures that are likely to
+# recur across papers. Corpus replacements are narrower patches observed in the
+# current appendix-heavy regression corpus and should be promoted into the
+# generic tier only after they show up in multiple papers.
+#
+GENERIC_SURFACE_REPLACEMENTS = (
     ("definedin", "defined in"),
     ("weredefinedonly", "were defined only"),
     ("satisfiesthefollowing", "satisfies the following"),
     ("wecallitis", "we call it"),
-    ("quantilesummaryoftwodataset", "quantile summary of two dataset"),
     ("aredefinedtobe", "are defined to be"),
     ("functionThe", "function\nThe"),
     ("function The", "function\nThe"),
@@ -53,16 +71,21 @@ SURFACE_REPLACEMENTS = (
     ("fory", "for y"),
     ("fori", "for i"),
     ("∈X", "∈ X"),
-    ("estimater", "estimate r"),
-    ("andr-(", "and r-("),
-    ("andr+(", "and r+("),
     ("andω", "and ω"),
     ("isan", "is an"),
     ("wehave", "we have"),
+    ("meansthe", "means the"),
+    ("realworld", "real-world"),
+    ("tob+1", "to b+1"),
+)
+CORPUS_SURFACE_REPLACEMENTS = (
+    ("quantilesummaryoftwodataset", "quantile summary of two dataset"),
+    ("estimater", "estimate r"),
+    ("andr-(", "and r-("),
+    ("andr+(", "and r+("),
     ("Notethattherank", "Note that the rank"),
     ("followingproperty", "following property"),
     ("copiedfromoriginalsummary", "copied from original summary"),
-    ("meansthe", "means the"),
     ("approximatesummary", "approximate summary"),
     ("areselectedbyquerytheoriginalsummarysuchthat", "are selected by querying the original summary such that"),
     ("ω˜DtoX", "ω˜D to X"),
@@ -70,8 +93,6 @@ SURFACE_REPLACEMENTS = (
     ("˜ωDto", "˜ωD to"),
     ("˜ωDare", "˜ωD are"),
     ("DinQ′", "D in Q′"),
-    ("realworld", "real-world"),
-    ("tob+1", "to b+1"),
 )
 
 
@@ -180,8 +201,65 @@ class FormulaBoxKind(str, Enum):
 class FormulaBoxAnalysis:
     kind: FormulaBoxKind
     usefulness_score: float
+    standalone_score: float
+    promotion_score: float
     should_standalone: bool
     should_promote: bool
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PaperMathDiagnostics:
+    pages_evaluated: int
+    region_count: int
+    display_math_regions: int
+    promoted_regions: int
+    fallback_regions: int
+    formula_box_split_regions: int
+    embedded_display_run_regions: int
+    inline_noise_merged: int
+    suspected_figure_label_suppressions: int
+    author_affiliation_suppressions: int
+    bibliography_entry_suppressions: int
+    experimental_candidate_pages: int
+    reference_like_pages: int
+    figure_table_like_pages: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "pages_evaluated": self.pages_evaluated,
+            "region_count": self.region_count,
+            "display_math_regions": self.display_math_regions,
+            "promoted_regions": self.promoted_regions,
+            "fallback_regions": self.fallback_regions,
+            "formula_box_split_regions": self.formula_box_split_regions,
+            "embedded_display_run_regions": self.embedded_display_run_regions,
+            "inline_noise_merged": self.inline_noise_merged,
+            "suspected_figure_label_suppressions": self.suspected_figure_label_suppressions,
+            "author_affiliation_suppressions": self.author_affiliation_suppressions,
+            "bibliography_entry_suppressions": self.bibliography_entry_suppressions,
+            "experimental_candidate_pages": self.experimental_candidate_pages,
+            "reference_like_pages": self.reference_like_pages,
+            "figure_table_like_pages": self.figure_table_like_pages,
+        }
+
+
+@dataclass(slots=True)
+class PageMathDiagnostics:
+    page_number: int
+    region_count: int
+    display_math_regions: int
+    promoted_regions: int
+    fallback_regions: int
+    formula_box_split_regions: int
+    embedded_display_run_regions: int
+    caption_regions: int
+    suspected_figure_label_suppressions: int
+    author_affiliation_suppressions: int
+    bibliography_entry_suppressions: int
+    experimental_candidate: bool
+    reference_like: bool
+    figure_table_like: bool
     reasons: list[str] = field(default_factory=list)
 
 
@@ -521,6 +599,15 @@ def classify_line(
             features=features,
         )
 
+    frontmatter_reason = _frontmatter_reason(features)
+    if frontmatter_reason is not None:
+        return LineClassification(
+            kind=LineKind.PROSE,
+            confidence=0.74,
+            reasons=[frontmatter_reason],
+            features=features,
+        )
+
     display_score = 0.0
     if features.symbol_density >= 0.14:
         display_score += 1.1
@@ -548,11 +635,27 @@ def classify_line(
         reasons.append("equation_number")
 
     if display_score >= 2.3:
-        confidence = min(0.98, 0.55 + display_score / 4.0)
+        if _looks_like_diagram_label_line(features):
+            return LineClassification(
+                kind=LineKind.PROSE,
+                confidence=0.68,
+                reasons=["diagram_label_like"],
+                features=features,
+            )
+        if _has_strong_display_math_signal(features.text, features):
+            confidence = min(0.98, 0.55 + display_score / 4.0)
+            return LineClassification(
+                kind=LineKind.DISPLAY_MATH,
+                confidence=confidence,
+                reasons=reasons,
+                features=features,
+            )
+
+    if display_score >= 1.4 and _looks_like_diagram_label_line(features) and features.prose_word_count <= 1:
         return LineClassification(
-            kind=LineKind.DISPLAY_MATH,
-            confidence=confidence,
-            reasons=reasons,
+            kind=LineKind.UNKNOWN,
+            confidence=0.45,
+            reasons=["diagram_label_like"],
             features=features,
         )
 
@@ -614,6 +717,61 @@ def _line_starts_formula_context(text: str) -> bool:
         or "satisfies" in text.lower()
         or text.lower().startswith("we define")
     )
+
+
+def _has_strong_display_math_signal(text: str, features: LineFeatures) -> bool:
+    if features.has_equation_number:
+        return True
+    return bool(STRONG_MATH_RELATION_RE.search(text))
+
+
+def _frontmatter_reason(features: LineFeatures) -> str | None:
+    text = features.text.strip()
+    if not text:
+        return None
+    if (
+        (re.match(r"^\s*\d+\s+", text) or re.match(r"^\s*\[\d+\]", text))
+        and (BIBLIOGRAPHY_RE.search(text) or len(CAPITALIZED_WORD_RE.findall(text)) >= 3)
+    ):
+        return "bibliography_entry_like"
+    if EMAIL_OR_URL_RE.search(text):
+        return "author_affiliation_like"
+    if AFFILIATION_RE.search(text) and features.operator_count <= 1:
+        return "author_affiliation_like"
+
+    capitalized_words = len(CAPITALIZED_WORD_RE.findall(text))
+    if (
+        capitalized_words >= 2
+        and features.word_count <= 8
+        and features.prose_word_count >= 2
+        and features.operator_count <= 1
+        and not text.endswith((".", ":"))
+    ):
+        return "author_affiliation_like"
+    return None
+
+
+def _looks_like_diagram_label_line(features: LineFeatures) -> bool:
+    text = features.text.strip()
+    if not text:
+        return False
+    if _has_strong_display_math_signal(text, features):
+        return False
+    if text.endswith((".", ":")):
+        return False
+    if features.word_count == 0 or features.word_count > 4:
+        return False
+    if features.prose_word_count > 2:
+        return False
+    if features.operator_count > 1:
+        return False
+    if features.relative_width > 0.72:
+        return False
+    if features.script_fraction < 0.08 and not re.search(r"[∆_ωϵλγΣΠ]", text):
+        return False
+    if features.script_fraction < 0.08 and features.centeredness < 0.55:
+        return False
+    return bool(re.search(r"[A-Za-z]", text))
 
 
 def _analyze_segment(segment: PageSegment, *, page_width: float) -> SegmentAnalysis:
@@ -1090,7 +1248,9 @@ def _format_bbox(bbox: tuple[float, float, float, float]) -> str:
 
 def _normalize_surface_text(text: str) -> str:
     normalized = text
-    for source, target in SURFACE_REPLACEMENTS:
+    for source, target in GENERIC_SURFACE_REPLACEMENTS:
+        normalized = normalized.replace(source, target)
+    for source, target in CORPUS_SURFACE_REPLACEMENTS:
         normalized = normalized.replace(source, target)
 
     normalized = re.sub(r"(?<=\))(?=[A-Za-z])", " ", normalized)
@@ -1644,6 +1804,9 @@ def split_embedded_display_math_regions(regions: list[RegionBlock]) -> list[Regi
 
         for segment in region.segments:
             for box_analysis in _split_segment_into_box_analyses(segment):
+                if any(line.classification.kind == LineKind.CAPTION for line in box_analysis.lines):
+                    pending.append(box_analysis)
+                    continue
                 for chunk in _split_segment_by_display_math_runs(box_analysis, parent_kind=region.kind):
                     if chunk.base_kind == RegionKind.DISPLAY_MATH_BLOCK:
                         flush_pending()
@@ -1692,10 +1855,16 @@ def analyze_formula_box_region(
     page_width: float,
     previous_context: str,
     next_context: str,
+    previous_region_kind: RegionKind | None = None,
+    next_region_kind: RegionKind | None = None,
+    previous_region_source: RegionSource | None = None,
+    next_region_source: RegionSource | None = None,
 ) -> FormulaBoxAnalysis:
     if region.source != RegionSource.FORMULA_BOX_SPLIT:
         return FormulaBoxAnalysis(
             FormulaBoxKind.UNKNOWN,
+            0.0,
+            0.0,
             0.0,
             True,
             False,
@@ -1705,6 +1874,8 @@ def analyze_formula_box_region(
         return FormulaBoxAnalysis(
             FormulaBoxKind.UNKNOWN,
             0.0,
+            0.0,
+            0.0,
             True,
             False,
             ["not_display_math_block"],
@@ -1712,6 +1883,8 @@ def analyze_formula_box_region(
     if not region.segments or not all(segment.has_formula_boxes for segment in region.segments):
         return FormulaBoxAnalysis(
             FormulaBoxKind.UNKNOWN,
+            0.0,
+            0.0,
             0.0,
             True,
             False,
@@ -1723,18 +1896,45 @@ def analyze_formula_box_region(
         return FormulaBoxAnalysis(
             FormulaBoxKind.UNKNOWN,
             0.0,
+            0.0,
+            0.0,
             True,
             False,
             ["empty_formula_boxes"],
         )
 
     stub_kind = _formula_box_stub_kind(region, previous_context=previous_context, next_context=next_context)
+    previous_lower = previous_context.lower()
+    next_lower = next_context.lower()
     max_width = max((box.bbox[2] - box.bbox[0] for box in boxes), default=0.0)
     max_height = max((box.bbox[3] - box.bbox[1] for box in boxes), default=0.0)
     width_ratio = max_width / page_width if page_width > 0 else 0.0
     large_display = len(boxes) > 1 or max_height >= 24.0 or width_ratio >= 0.45
     tiny_inline = len(boxes) == 1 and max_height < 24.0 and width_ratio < 0.42
+    prose_like_neighbors = {
+        RegionKind.PROSE,
+        RegionKind.INLINE_MATH_PROSE,
+        RegionKind.THEOREM_PROOF_BLOCK,
+    }
+    math_like_neighbors = {RegionKind.DISPLAY_MATH_BLOCK}
+    between_prose_regions = (
+        previous_region_kind in prose_like_neighbors and next_region_kind in prose_like_neighbors
+    )
+    between_display_regions = (
+        previous_region_kind in math_like_neighbors and next_region_kind in math_like_neighbors
+    )
+    inside_theorem_proof_context = (
+        previous_region_kind == RegionKind.THEOREM_PROOF_BLOCK
+        or next_region_kind == RegionKind.THEOREM_PROOF_BLOCK
+    )
+    after_formula_intro = any(
+        marker in previous_lower
+        for marker in ("as follows", "satisfies", "defined as", "let us define", "we define", "constraints")
+    )
+    before_formula_tail = next_lower.startswith("for all") or next_lower.startswith("where ")
     reasons: list[str] = []
+    standalone_score = 0.65 if large_display else 0.25 if tiny_inline else 0.5
+    promotion_score = 0.25 if large_display else 0.1 if tiny_inline else 0.2
 
     if large_display:
         reasons.append("display_sized")
@@ -1742,48 +1942,135 @@ def analyze_formula_box_region(
         reasons.append("tiny_box")
     if len(boxes) > 1:
         reasons.append("formula_box_run")
+    if between_prose_regions:
+        reasons.append("between_prose_regions")
+        standalone_score -= 0.1
+        promotion_score -= 0.1
+    if between_display_regions:
+        reasons.append("between_display_regions")
+        standalone_score += 0.1
+    if inside_theorem_proof_context:
+        reasons.append("inside_theorem_proof_context")
+        promotion_score -= 0.05
+    if after_formula_intro:
+        reasons.append("formula_intro_context")
+        standalone_score += 0.12
+        promotion_score += 0.06
+    if before_formula_tail:
+        reasons.append("formula_tail_context")
+        standalone_score += 0.08
+        promotion_score += 0.04
+    if previous_region_source == RegionSource.EMBEDDED_DISPLAY_RUN or next_region_source == RegionSource.EMBEDDED_DISPLAY_RUN:
+        reasons.append("adjacent_embedded_display")
+        standalone_score += 0.08
 
     if stub_kind == "case-definition":
         reasons.append("case_definition_stub")
-        return FormulaBoxAnalysis(FormulaBoxKind.CASE_DEFINITION, 0.95, True, True, reasons)
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.CASE_DEFINITION,
+            0.95,
+            max(standalone_score, 0.94),
+            max(promotion_score, 0.93),
+            True,
+            True,
+            reasons,
+        )
     if stub_kind == "constraint":
         reasons.append("constraint_stub")
-        return FormulaBoxAnalysis(FormulaBoxKind.CONSTRAINT_SET, 0.93, True, True, reasons)
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.CONSTRAINT_SET,
+            0.93,
+            max(standalone_score, 0.92),
+            max(promotion_score, 0.9),
+            True,
+            True,
+            reasons,
+        )
     if stub_kind == "algorithm-step":
         reasons.append("algorithm_stub")
+        standalone_score = max(standalone_score, 0.72 if large_display else 0.58)
+        promotion_score = min(max(promotion_score, 0.36), 0.58)
         return FormulaBoxAnalysis(
             FormulaBoxKind.ALGORITHM_MATH,
-            0.78 if large_display else 0.62,
-            True,
-            False,
+            max(standalone_score, promotion_score),
+            standalone_score,
+            promotion_score,
+            standalone_score >= 0.55,
+            promotion_score >= 0.75,
             reasons,
         )
     if stub_kind and stub_kind.startswith("numbered-equation"):
         reasons.append("numbered_equation")
-        return FormulaBoxAnalysis(FormulaBoxKind.DISPLAY_EQUATION, 0.9, True, True, reasons)
+        standalone_score = max(standalone_score, 0.88)
+        promotion_score = max(promotion_score, 0.9)
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.DISPLAY_EQUATION,
+            max(standalone_score, promotion_score),
+            standalone_score,
+            promotion_score,
+            True,
+            True,
+            reasons,
+        )
     if stub_kind == "derivation":
         reasons.append("derivation_stub")
+        standalone_score = max(standalone_score, 0.82 if large_display else 0.54)
+        promotion_score = max(promotion_score, 0.42 if large_display else 0.22)
         return FormulaBoxAnalysis(
             FormulaBoxKind.DERIVATION_STEP,
-            0.86 if large_display else 0.58,
-            True,
-            False,
+            max(standalone_score, promotion_score),
+            standalone_score,
+            promotion_score,
+            standalone_score >= 0.55,
+            promotion_score >= 0.8,
             reasons,
         )
     if stub_kind == "equation" and large_display:
         reasons.append("equation_stub")
-        return FormulaBoxAnalysis(FormulaBoxKind.DISPLAY_EQUATION, 0.84, True, False, reasons)
+        standalone_score = max(standalone_score, 0.8)
+        promotion_score = max(promotion_score, 0.45)
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.DISPLAY_EQUATION,
+            max(standalone_score, promotion_score),
+            standalone_score,
+            promotion_score,
+            standalone_score >= 0.55,
+            promotion_score >= 0.82,
+            reasons,
+        )
     if stub_kind == "equation" and tiny_inline:
         reasons.extend(["equation_stub", "prose_neighbors"])
-        return FormulaBoxAnalysis(FormulaBoxKind.INLINE_NOISE, 0.2, False, False, reasons)
+        standalone_score = min(standalone_score, 0.25)
+        promotion_score = min(promotion_score, 0.1)
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.INLINE_NOISE,
+            max(standalone_score, promotion_score),
+            standalone_score,
+            promotion_score,
+            False,
+            False,
+            reasons,
+        )
     if tiny_inline:
         reasons.append("prose_neighbors")
-        return FormulaBoxAnalysis(FormulaBoxKind.INLINE_NOISE, 0.25, False, False, reasons)
+        standalone_score = min(standalone_score, 0.3)
+        promotion_score = min(promotion_score, 0.12)
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.INLINE_NOISE,
+            max(standalone_score, promotion_score),
+            standalone_score,
+            promotion_score,
+            False,
+            False,
+            reasons,
+        )
     return FormulaBoxAnalysis(
         FormulaBoxKind.UNKNOWN,
-        0.55 if large_display else 0.4,
-        True,
-        False,
+        max(standalone_score, promotion_score),
+        standalone_score,
+        promotion_score,
+        standalone_score >= 0.55,
+        promotion_score >= 0.82,
         reasons or ["context_dependent_formula"],
     )
 
@@ -1793,9 +2080,41 @@ def merge_low_value_formula_box_regions(regions: list[RegionBlock], *, page_widt
         return []
 
     merged: list[RegionBlock] = []
+    prose_like_kinds = {
+        RegionKind.THEOREM_PROOF_BLOCK,
+        RegionKind.PROSE,
+        RegionKind.INLINE_MATH_PROSE,
+        RegionKind.UNKNOWN,
+    }
 
     def fallback_text(region: RegionBlock) -> str:
         return _serialize_region_block_stable(region, page_width=page_width)
+
+    def find_forward_target(start: int) -> int | None:
+        skipped_display = 0
+        for candidate_index in range(start + 1, len(regions)):
+            candidate = regions[candidate_index]
+            if candidate.kind in prose_like_kinds:
+                return candidate_index
+            if candidate.kind == RegionKind.DISPLAY_MATH_BLOCK:
+                skipped_display += 1
+                if skipped_display <= 2:
+                    continue
+            break
+        return None
+
+    def find_backward_target() -> int | None:
+        skipped_display = 0
+        for candidate_index in range(len(merged) - 1, -1, -1):
+            candidate = merged[candidate_index]
+            if candidate.kind in prose_like_kinds:
+                return candidate_index
+            if candidate.kind == RegionKind.DISPLAY_MATH_BLOCK:
+                skipped_display += 1
+                if skipped_display <= 2:
+                    continue
+            break
+        return None
 
     index = 0
     while index < len(regions):
@@ -1809,6 +2128,10 @@ def merge_low_value_formula_box_regions(regions: list[RegionBlock], *, page_widt
             page_width=page_width,
             previous_context=previous_context,
             next_context=next_context,
+            previous_region_kind=previous_region.kind if previous_region is not None else None,
+            next_region_kind=next_region.kind if next_region is not None else None,
+            previous_region_source=previous_region.source if previous_region is not None else None,
+            next_region_source=next_region.source if next_region is not None else None,
         )
 
         if formula_analysis.should_standalone:
@@ -1817,12 +2140,10 @@ def merge_low_value_formula_box_regions(regions: list[RegionBlock], *, page_widt
             continue
 
         merged_into_previous = False
-        if previous_region is not None and previous_region.kind in {
-            RegionKind.THEOREM_PROOF_BLOCK,
-            RegionKind.PROSE,
-            RegionKind.INLINE_MATH_PROSE,
-        }:
-            merged[-1] = _build_region_block(
+        backward_target = find_backward_target()
+        if backward_target is not None:
+            previous_region = merged[backward_target]
+            merged[backward_target] = _build_region_block(
                 previous_region.kind,
                 previous_region.segments + region.segments,
                 page_number=previous_region.page_number,
@@ -1834,12 +2155,10 @@ def merge_low_value_formula_box_regions(regions: list[RegionBlock], *, page_widt
             index += 1
             continue
 
-        if next_region is not None and next_region.kind in {
-            RegionKind.THEOREM_PROOF_BLOCK,
-            RegionKind.PROSE,
-            RegionKind.INLINE_MATH_PROSE,
-        }:
-            regions[index + 1] = _build_region_block(
+        forward_target = find_forward_target(index)
+        if forward_target is not None:
+            next_region = regions[forward_target]
+            regions[forward_target] = _build_region_block(
                 next_region.kind,
                 region.segments + next_region.segments,
                 page_number=next_region.page_number,
@@ -1855,63 +2174,7 @@ def merge_low_value_formula_box_regions(regions: list[RegionBlock], *, page_widt
 
 def build_page_regions(page: RawLayoutPage) -> list[RegionBlock]:
     analyses = [_analyze_segment(segment, page_width=page.width) for segment in build_page_segments(page)]
-    regions: list[RegionBlock] = []
-    index = 0
-
-    while index < len(analyses):
-        current = analyses[index]
-        kind = current.base_kind
-        grouped = [current]
-        index += 1
-
-        if kind == RegionKind.THEOREM_PROOF_BLOCK:
-            while index < len(analyses) and _can_absorb_into_theorem_block(analyses[index]):
-                if analyses[index].base_kind == RegionKind.THEOREM_PROOF_BLOCK and grouped:
-                    break
-                grouped.append(analyses[index])
-                index += 1
-        elif kind == RegionKind.DISPLAY_MATH_BLOCK:
-            while index < len(analyses) and analyses[index].base_kind == RegionKind.DISPLAY_MATH_BLOCK:
-                grouped.append(analyses[index])
-                index += 1
-        elif kind in {RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
-            if index < len(analyses) and analyses[index].base_kind == RegionKind.DISPLAY_MATH_BLOCK and _segment_ends_formula_preface(current):
-                kind = RegionKind.THEOREM_PROOF_BLOCK
-                grouped.append(analyses[index])
-                index += 1
-                while index < len(analyses) and analyses[index].base_kind in {
-                    RegionKind.PROSE,
-                    RegionKind.INLINE_MATH_PROSE,
-                    RegionKind.DISPLAY_MATH_BLOCK,
-                }:
-                    if analyses[index].base_kind == RegionKind.THEOREM_PROOF_BLOCK:
-                        break
-                    grouped.append(analyses[index])
-                    index += 1
-            else:
-                while index < len(analyses) and analyses[index].base_kind in {RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
-                    kind = _merge_prose_kind(kind, analyses[index].base_kind)
-                    grouped.append(analyses[index])
-                    index += 1
-        elif kind == RegionKind.ALGORITHM_BLOCK:
-            while index < len(analyses) and analyses[index].base_kind == RegionKind.ALGORITHM_BLOCK:
-                grouped.append(analyses[index])
-                index += 1
-        elif kind == RegionKind.LIST_BLOCK:
-            while index < len(analyses) and analyses[index].base_kind == RegionKind.LIST_BLOCK:
-                grouped.append(analyses[index])
-                index += 1
-
-        regions.append(
-            _build_region_block(
-                kind,
-                grouped,
-                page_number=page.page_number,
-                source=RegionSource.INITIAL_GROUPING,
-            )
-        )
-
-    split_regions = split_embedded_display_math_regions(regions)
+    split_regions = split_embedded_display_math_regions(_build_initial_page_regions(page, analyses))
     return merge_low_value_formula_box_regions(split_regions, page_width=page.width)
 
 
@@ -2050,10 +2313,18 @@ def should_use_region_serializer(
     page_width: float | None = None,
     previous_context: str = "",
     next_context: str = "",
+    previous_region_kind: RegionKind | None = None,
+    next_region_kind: RegionKind | None = None,
+    previous_region_source: RegionSource | None = None,
+    next_region_source: RegionSource | None = None,
 ) -> bool:
     if region.kind != RegionKind.DISPLAY_MATH_BLOCK:
         return False
     if region.confidence < 0.85:
+        return False
+    if previous_region_kind == RegionKind.CAPTION or next_region_kind == RegionKind.CAPTION:
+        return False
+    if re.search(r"\b(?:Figure|Fig\.|Table)\b", previous_context) or re.search(r"\b(?:Figure|Fig\.|Table)\b", next_context):
         return False
     if any(segment.has_formula_boxes for segment in region.segments):
         if region.source != RegionSource.FORMULA_BOX_SPLIT or page_width is None:
@@ -2063,6 +2334,10 @@ def should_use_region_serializer(
             page_width=page_width,
             previous_context=previous_context,
             next_context=next_context,
+            previous_region_kind=previous_region_kind,
+            next_region_kind=next_region_kind,
+            previous_region_source=previous_region_source,
+            next_region_source=next_region_source,
         )
         return analysis.should_promote
     if region.source == RegionSource.FORMULA_BOX_SPLIT:
@@ -2073,6 +2348,10 @@ def should_use_region_serializer(
             page_width=page_width,
             previous_context=previous_context,
             next_context=next_context,
+            previous_region_kind=previous_region_kind,
+            next_region_kind=next_region_kind,
+            previous_region_source=previous_region_source,
+            next_region_source=next_region_source,
         )
         return analysis.should_promote
 
@@ -2192,12 +2471,20 @@ def build_region_review_report(document: RawLayoutDocument) -> str:
                     page_width=page.width,
                     previous_context=previous_context,
                     next_context=next_context,
+                    previous_region_kind=regions[index - 1].kind if index > 0 else None,
+                    next_region_kind=regions[index + 1].kind if index + 1 < len(regions) else None,
+                    previous_region_source=regions[index - 1].source if index > 0 else None,
+                    next_region_source=regions[index + 1].source if index + 1 < len(regions) else None,
                 )
             use_specialized = should_use_region_serializer(
                 region,
                 page_width=page.width,
                 previous_context=previous_context,
                 next_context=next_context,
+                previous_region_kind=regions[index - 1].kind if index > 0 else None,
+                next_region_kind=regions[index + 1].kind if index + 1 < len(regions) else None,
+                previous_region_source=regions[index - 1].source if index > 0 else None,
+                next_region_source=regions[index + 1].source if index + 1 < len(regions) else None,
             )
             lines.append(
                 "  "
@@ -2218,6 +2505,8 @@ def build_region_review_report(document: RawLayoutDocument) -> str:
                 lines.append(
                     "    "
                     f"formula_kind={formula_analysis.kind.value} usefulness={formula_analysis.usefulness_score:.2f} "
+                    f"standalone_score={formula_analysis.standalone_score:.2f} "
+                    f"promotion_score={formula_analysis.promotion_score:.2f} "
                     f"standalone={'yes' if formula_analysis.should_standalone else 'no'} "
                     f"promote={'yes' if formula_analysis.should_promote else 'no'}"
                 )
@@ -2297,11 +2586,17 @@ def serialize_page_with_region_promotion(page: RawLayoutPage) -> str:
             if later_text:
                 next_context = later_text
                 break
+        previous_region = regions[index - 1] if index > 0 else None
+        next_region = regions[index + 1] if index + 1 < len(regions) else None
         if should_use_region_serializer(
             region,
             page_width=page.width,
             previous_context=previous_context,
             next_context=next_context,
+            previous_region_kind=previous_region.kind if previous_region is not None else None,
+            next_region_kind=next_region.kind if next_region is not None else None,
+            previous_region_source=previous_region.source if previous_region is not None else None,
+            next_region_source=next_region.source if next_region is not None else None,
         ):
             text = serialize_region_block(
                 region,
@@ -2320,6 +2615,239 @@ def serialize_page_with_region_promotion(page: RawLayoutPage) -> str:
         rendered.append(text)
 
     return _normalize_surface_text("".join(rendered).strip())
+
+
+def build_page_math_diagnostics(page: RawLayoutPage) -> PageMathDiagnostics:
+    analyses = [_analyze_segment(segment, page_width=page.width) for segment in build_page_segments(page)]
+    pre_merge_regions = split_embedded_display_math_regions(_build_initial_page_regions(page, analyses))
+    final_regions = merge_low_value_formula_box_regions(pre_merge_regions, page_width=page.width)
+
+    display_math_regions = 0
+    promoted_regions = 0
+    formula_box_split_regions = 0
+    embedded_display_run_regions = 0
+    caption_regions = 0
+    suspected_figure_label_suppressions = 0
+    author_affiliation_suppressions = 0
+    bibliography_entry_suppressions = 0
+
+    for analysis in analyses:
+        for line in analysis.lines:
+            if "diagram_label_like" in line.classification.reasons:
+                suspected_figure_label_suppressions += 1
+            if "author_affiliation_like" in line.classification.reasons:
+                author_affiliation_suppressions += 1
+            if "bibliography_entry_like" in line.classification.reasons:
+                bibliography_entry_suppressions += 1
+
+    stable_texts = [_serialize_region_block_stable(region, page_width=page.width) for region in final_regions]
+    for index, region in enumerate(final_regions):
+        if region.kind == RegionKind.DISPLAY_MATH_BLOCK:
+            display_math_regions += 1
+        if region.kind == RegionKind.CAPTION:
+            caption_regions += 1
+        if region.source == RegionSource.FORMULA_BOX_SPLIT:
+            formula_box_split_regions += 1
+        if region.source == RegionSource.EMBEDDED_DISPLAY_RUN:
+            embedded_display_run_regions += 1
+
+        previous_context = ""
+        next_context = ""
+        for earlier in reversed(stable_texts[:index]):
+            if earlier:
+                previous_context = earlier
+                break
+        for later in stable_texts[index + 1 :]:
+            if later:
+                next_context = later
+                break
+
+        previous_region = final_regions[index - 1] if index > 0 else None
+        next_region = final_regions[index + 1] if index + 1 < len(final_regions) else None
+        if should_use_region_serializer(
+            region,
+            page_width=page.width,
+            previous_context=previous_context,
+            next_context=next_context,
+            previous_region_kind=previous_region.kind if previous_region is not None else None,
+            next_region_kind=next_region.kind if next_region is not None else None,
+            previous_region_source=previous_region.source if previous_region is not None else None,
+            next_region_source=next_region.source if next_region is not None else None,
+        ):
+            promoted_regions += 1
+
+    fallback_regions = max(display_math_regions - promoted_regions, 0)
+    reference_like = bibliography_entry_suppressions >= 5 and display_math_regions <= 1
+    figure_table_like = caption_regions >= 2 and promoted_regions == 0 and display_math_regions <= 2
+    experimental_candidate = (
+        not reference_like
+        and not figure_table_like
+        and (
+            promoted_regions > 0
+            or embedded_display_run_regions > 0
+            or formula_box_split_regions >= 2
+            or display_math_regions >= 3
+        )
+    )
+    reasons: list[str] = []
+    if reference_like:
+        reasons.append("reference_like_page")
+    if figure_table_like:
+        reasons.append("figure_table_like_page")
+    if experimental_candidate:
+        reasons.append("experimental_candidate")
+
+    return PageMathDiagnostics(
+        page_number=page.page_number,
+        region_count=len(final_regions),
+        display_math_regions=display_math_regions,
+        promoted_regions=promoted_regions,
+        fallback_regions=fallback_regions,
+        formula_box_split_regions=formula_box_split_regions,
+        embedded_display_run_regions=embedded_display_run_regions,
+        caption_regions=caption_regions,
+        suspected_figure_label_suppressions=suspected_figure_label_suppressions,
+        author_affiliation_suppressions=author_affiliation_suppressions,
+        bibliography_entry_suppressions=bibliography_entry_suppressions,
+        experimental_candidate=experimental_candidate,
+        reference_like=reference_like,
+        figure_table_like=figure_table_like,
+        reasons=reasons,
+    )
+
+
+def should_use_experimental_math_on_page(page: RawLayoutPage) -> bool:
+    return build_page_math_diagnostics(page).experimental_candidate
+
+
+def build_paper_math_diagnostics(document: RawLayoutDocument) -> PaperMathDiagnostics:
+    region_count = 0
+    display_math_regions = 0
+    promoted_regions = 0
+    formula_box_split_regions = 0
+    embedded_display_run_regions = 0
+    suspected_figure_label_suppressions = 0
+    author_affiliation_suppressions = 0
+    bibliography_entry_suppressions = 0
+    inline_noise_merged = 0
+    experimental_candidate_pages = 0
+    reference_like_pages = 0
+    figure_table_like_pages = 0
+
+    for page in document.pages:
+        analyses = [_analyze_segment(segment, page_width=page.width) for segment in build_page_segments(page)]
+        pre_merge_regions = split_embedded_display_math_regions(_build_initial_page_regions(page, analyses))
+        final_regions = merge_low_value_formula_box_regions(pre_merge_regions, page_width=page.width)
+        page_diagnostics = build_page_math_diagnostics(page)
+
+        region_count += page_diagnostics.region_count
+        display_math_regions += page_diagnostics.display_math_regions
+        promoted_regions += page_diagnostics.promoted_regions
+        formula_box_split_regions += page_diagnostics.formula_box_split_regions
+        embedded_display_run_regions += page_diagnostics.embedded_display_run_regions
+        suspected_figure_label_suppressions += page_diagnostics.suspected_figure_label_suppressions
+        author_affiliation_suppressions += page_diagnostics.author_affiliation_suppressions
+        bibliography_entry_suppressions += page_diagnostics.bibliography_entry_suppressions
+        experimental_candidate_pages += int(page_diagnostics.experimental_candidate)
+        reference_like_pages += int(page_diagnostics.reference_like)
+        figure_table_like_pages += int(page_diagnostics.figure_table_like)
+
+        for index, region in enumerate(pre_merge_regions):
+            if region.source != RegionSource.FORMULA_BOX_SPLIT:
+                continue
+            previous_region = pre_merge_regions[index - 1] if index > 0 else None
+            next_region = pre_merge_regions[index + 1] if index + 1 < len(pre_merge_regions) else None
+            previous_context = _serialize_region_block_stable(previous_region, page_width=page.width) if previous_region is not None else ""
+            next_context = _serialize_region_block_stable(next_region, page_width=page.width) if next_region is not None else ""
+            analysis = analyze_formula_box_region(
+                region,
+                page_width=page.width,
+                previous_context=previous_context,
+                next_context=next_context,
+                previous_region_kind=previous_region.kind if previous_region is not None else None,
+                next_region_kind=next_region.kind if next_region is not None else None,
+                previous_region_source=previous_region.source if previous_region is not None else None,
+                next_region_source=next_region.source if next_region is not None else None,
+            )
+            if analysis.kind == FormulaBoxKind.INLINE_NOISE and not analysis.should_standalone:
+                inline_noise_merged += 1
+
+    return PaperMathDiagnostics(
+        pages_evaluated=document.page_count,
+        region_count=region_count,
+        display_math_regions=display_math_regions,
+        promoted_regions=promoted_regions,
+        fallback_regions=max(display_math_regions - promoted_regions, 0),
+        formula_box_split_regions=formula_box_split_regions,
+        embedded_display_run_regions=embedded_display_run_regions,
+        inline_noise_merged=inline_noise_merged,
+        suspected_figure_label_suppressions=suspected_figure_label_suppressions,
+        author_affiliation_suppressions=author_affiliation_suppressions,
+        bibliography_entry_suppressions=bibliography_entry_suppressions,
+        experimental_candidate_pages=experimental_candidate_pages,
+        reference_like_pages=reference_like_pages,
+        figure_table_like_pages=figure_table_like_pages,
+    )
+
+
+def _build_initial_page_regions(page: RawLayoutPage, analyses: list[SegmentAnalysis]) -> list[RegionBlock]:
+    regions: list[RegionBlock] = []
+    index = 0
+
+    while index < len(analyses):
+        current = analyses[index]
+        kind = current.base_kind
+        grouped = [current]
+        index += 1
+
+        if kind == RegionKind.THEOREM_PROOF_BLOCK:
+            while index < len(analyses) and _can_absorb_into_theorem_block(analyses[index]):
+                if analyses[index].base_kind == RegionKind.THEOREM_PROOF_BLOCK and grouped:
+                    break
+                grouped.append(analyses[index])
+                index += 1
+        elif kind == RegionKind.DISPLAY_MATH_BLOCK:
+            while index < len(analyses) and analyses[index].base_kind == RegionKind.DISPLAY_MATH_BLOCK:
+                grouped.append(analyses[index])
+                index += 1
+        elif kind in {RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
+            if index < len(analyses) and analyses[index].base_kind == RegionKind.DISPLAY_MATH_BLOCK and _segment_ends_formula_preface(current):
+                kind = RegionKind.THEOREM_PROOF_BLOCK
+                grouped.append(analyses[index])
+                index += 1
+                while index < len(analyses) and analyses[index].base_kind in {
+                    RegionKind.PROSE,
+                    RegionKind.INLINE_MATH_PROSE,
+                    RegionKind.DISPLAY_MATH_BLOCK,
+                }:
+                    if analyses[index].base_kind == RegionKind.THEOREM_PROOF_BLOCK:
+                        break
+                    grouped.append(analyses[index])
+                    index += 1
+            else:
+                while index < len(analyses) and analyses[index].base_kind in {RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
+                    kind = _merge_prose_kind(kind, analyses[index].base_kind)
+                    grouped.append(analyses[index])
+                    index += 1
+        elif kind == RegionKind.ALGORITHM_BLOCK:
+            while index < len(analyses) and analyses[index].base_kind == RegionKind.ALGORITHM_BLOCK:
+                grouped.append(analyses[index])
+                index += 1
+        elif kind == RegionKind.LIST_BLOCK:
+            while index < len(analyses) and analyses[index].base_kind == RegionKind.LIST_BLOCK:
+                grouped.append(analyses[index])
+                index += 1
+
+        regions.append(
+            _build_region_block(
+                kind,
+                grouped,
+                page_number=page.page_number,
+                source=RegionSource.INITIAL_GROUPING,
+            )
+        )
+
+    return regions
 
 
 def build_math_debug_report(

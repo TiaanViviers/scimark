@@ -13,6 +13,11 @@ from scimark.fallbacks import (
     render_table_region_fallbacks,
     reorder_algorithm_pages,
 )
+from scimark.layout import extract_raw_layout_document
+from scimark.math_spans import (
+    serialize_page_with_region_promotion,
+    should_use_experimental_math_on_page,
+)
 from scimark.paths import discover_pdfs
 from scimark.pipeline import PageMarkdown, PipelineOptions, run_pipeline_pages
 from scimark.report import write_manifest, write_report
@@ -26,6 +31,7 @@ class ConvertOptions:
     strip_picture_text: bool = True
     strip_page_numbers: bool = True
     keep_raw: bool = False
+    math_mode: str = "legacy"
 
 
 def _render_pdf_to_markdown_pages(pdf_path: Path, asset_dir: Path, dpi: int) -> list[PageMarkdown]:
@@ -61,6 +67,37 @@ def _render_pdf_to_markdown_pages(pdf_path: Path, asset_dir: Path, dpi: int) -> 
 
 def _count_images(asset_dir: Path) -> int:
     return sum(1 for path in asset_dir.glob("*.png") if path.is_file())
+
+
+def _apply_math_mode(
+    pages: list[PageMarkdown],
+    *,
+    pdf_path: Path,
+    math_mode: str,
+) -> list[PageMarkdown]:
+    if math_mode != "experimental" or not pages:
+        return pages
+
+    layout_document = extract_raw_layout_document(pdf_path)
+    layout_pages = {page.page_number: page for page in layout_document.pages}
+    rewritten: list[PageMarkdown] = []
+
+    for page in pages:
+        layout_page = layout_pages.get(page.page_number)
+        if layout_page is None or not should_use_experimental_math_on_page(layout_page):
+            rewritten.append(page)
+            continue
+
+        rewritten.append(
+            PageMarkdown(
+                page_number=page.page_number,
+                markdown=serialize_page_with_region_promotion(layout_page),
+                raw_markdown=page.raw_markdown,
+                page_boxes=page.page_boxes,
+            )
+        )
+
+    return rewritten
 
 
 def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -> ConversionSummary:
@@ -125,7 +162,12 @@ def convert_input(input_path: Path, output_dir: Path, options: ConvertOptions) -
                 raw_root.mkdir(parents=True, exist_ok=True)
                 raw_markdown_path.write_text(raw_markdown, encoding="utf-8")
 
-            ordered_pages = reorder_algorithm_pages(raw_pages)
+            math_pages = _apply_math_mode(
+                raw_pages,
+                pdf_path=pdf_path,
+                math_mode=options.math_mode,
+            )
+            ordered_pages = reorder_algorithm_pages(math_pages)
             pipeline_result = run_pipeline_pages(
                 ordered_pages,
                 PipelineOptions(

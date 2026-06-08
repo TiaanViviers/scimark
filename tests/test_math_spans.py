@@ -4,11 +4,14 @@ from scimark.math_spans import (
     LineKind,
     LineRun,
     MathRegion,
+    PaperMathDiagnostics,
     RegionKind,
     RegionBlock,
     RegionSource,
     SegmentAnalysis,
     analyze_formula_box_region,
+    build_paper_math_diagnostics,
+    build_page_math_diagnostics,
     build_math_debug_report,
     build_page_regions,
     build_region_review_report,
@@ -25,6 +28,7 @@ from scimark.math_spans import (
     serialize_region_block,
     serialize_region,
     serialize_line,
+    should_use_experimental_math_on_page,
     should_use_region_serializer,
     split_line_by_baseline,
 )
@@ -174,6 +178,67 @@ def test_classify_line_does_not_treat_hyphenated_prose_as_math_or_algorithm() ->
     classification = classify_line(line, serialized_text=serialize_line(line))
 
     assert classification.kind == LineKind.PROSE
+
+
+def test_classify_line_treats_author_affiliation_line_as_prose() -> None:
+    line = RawLayoutLine(
+        bbox=(80.0, 0.0, 240.0, 20.0),
+        spans=[
+            _span("Diederik", x0=80.0, x1=120.0),
+            _span("P.", x0=124.0, x1=136.0),
+            _span("Kingma", x0=140.0, x1=178.0),
+            _span("*", x0=182.0, x1=186.0, baseline=7.5, size=7.0, flags=1),
+        ],
+    )
+
+    classification = classify_line(
+        line,
+        serialized_text=serialize_line(line),
+        page_width=320.0,
+        box_bbox=(40.0, 0.0, 280.0, 24.0),
+    )
+
+    assert classification.kind == LineKind.PROSE
+    assert "author_affiliation_like" in classification.reasons
+
+
+def test_classify_line_treats_diagram_label_with_scripts_as_non_math() -> None:
+    line = RawLayoutLine(
+        bbox=(120.0, 0.0, 210.0, 20.0),
+        spans=[
+            _span("Discretize", x0=120.0, x1=170.0),
+            _span("∆", x0=176.0, x1=184.0),
+            _span("SRAMGPU", x0=184.5, x1=210.0, baseline=12.2, size=7.0),
+        ],
+    )
+
+    classification = classify_line(
+        line,
+        serialized_text=serialize_line(line),
+        page_width=400.0,
+        box_bbox=(80.0, 0.0, 240.0, 24.0),
+    )
+
+    assert classification.kind in {LineKind.PROSE, LineKind.UNKNOWN}
+    assert "diagram_label_like" in classification.reasons
+
+
+def test_classify_line_treats_bibliography_entry_as_prose() -> None:
+    line = RawLayoutLine(
+        bbox=(0.0, 0.0, 360.0, 20.0),
+        spans=[
+            _span(
+                "25 Chris Donahue, Julian Mc Auley, and Miller Puckette. In: The International Conference on Learning Representations (ICLR). 2019.",
+                x0=0.0,
+                x1=340.0,
+            )
+        ],
+    )
+
+    classification = classify_line(line, serialized_text=serialize_line(line))
+
+    assert classification.kind == LineKind.PROSE
+    assert "bibliography_entry_like" in classification.reasons
 
 
 def test_serialize_display_math_line_adds_math_spacing() -> None:
@@ -563,6 +628,99 @@ def test_build_page_regions_splits_embedded_display_math_run_from_formula_mixed_
     assert any(region.source == RegionSource.FORMULA_BOX_SPLIT for region in regions)
 
 
+def test_build_page_regions_does_not_split_embedded_display_run_inside_caption_mixed_region() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 260.0, 90.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(0.0, 0.0, 240.0, 20.0),
+                        spans=[_span("Figure 1: Overview.", x0=0.0, x1=100.0)],
+                    ),
+                    RawLayoutLine(
+                        bbox=(80.0, 24.0, 220.0, 44.0),
+                        spans=[
+                            _span("W", x0=80.0, x1=86.0),
+                            _span("∈", x0=90.0, x1=98.0),
+                            _span("R", x0=102.0, x1=108.0),
+                            _span("d×d", x0=110.0, x1=140.0),
+                        ],
+                    ),
+                    RawLayoutLine(
+                        bbox=(0.0, 48.0, 240.0, 68.0),
+                        spans=[_span("We only train A and B.", x0=0.0, x1=120.0)],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert len(regions) == 1
+    assert all(region.source != RegionSource.EMBEDDED_DISPLAY_RUN for region in regions)
+
+
+def test_build_page_regions_can_split_display_run_after_caption_box_in_mixed_region() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 260.0, 20.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(0.0, 0.0, 240.0, 20.0),
+                        spans=[_span("Figure 1: Overview.", x0=0.0, x1=100.0)],
+                    ),
+                ],
+            ),
+            RawLayoutBox(
+                source_index=1,
+                boxclass="text",
+                bbox=(0.0, 24.0, 260.0, 90.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(0.0, 24.0, 220.0, 44.0),
+                        spans=[_span("Proof. The key is to consider y.", x0=0.0, x1=160.0)],
+                    ),
+                    RawLayoutLine(
+                        bbox=(60.0, 48.0, 220.0, 68.0),
+                        spans=[
+                            _span("r", x0=60.0, x1=64.0),
+                            _span("D", x0=64.2, x1=68.0, baseline=60.2, size=7.0),
+                            _span("[+][(]", x0=68.2, x1=80.0, baseline=55.7, size=7.0),
+                            _span("[y]", x0=80.2, x1=86.0, baseline=55.7, size=7.0),
+                            _span("[)]", x0=86.2, x1=92.0, baseline=55.7, size=7.0),
+                            _span("-ω", x0=96.0, x1=104.0),
+                            _span("D", x0=104.2, x1=108.0, baseline=60.2, size=7.0),
+                            _span("=[0]", x0=112.0, x1=126.0),
+                        ],
+                    ),
+                    RawLayoutLine(
+                        bbox=(0.0, 72.0, 220.0, 90.0),
+                        spans=[_span("Therefore x_i = 0.", x0=0.0, x1=90.0)],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert any(region.source == RegionSource.EMBEDDED_DISPLAY_RUN for region in regions)
+    assert any(region.kind == RegionKind.CAPTION for region in regions)
+
+
 def test_build_page_regions_merges_back_low_value_formula_box_split() -> None:
     page = RawLayoutPage(
         page_number=1,
@@ -590,6 +748,48 @@ def test_build_page_regions_merges_back_low_value_formula_box_split() -> None:
     assert all(region.source != RegionSource.FORMULA_BOX_SPLIT for region in regions)
     assert len(regions) == 1
     assert regions[0].kind == RegionKind.THEOREM_PROOF_BLOCK
+
+
+def test_build_page_regions_merges_low_value_formula_box_past_adjacent_display_block() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 220.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 220.0, 20.0), spans=[_span("A.1", x0=0.0, x1=30.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(40.0, 24.0, 280.0, 56.0)),
+            RawLayoutBox(source_index=2, boxclass="formula", bbox=(80.0, 60.0, 140.0, 74.0)),
+            RawLayoutBox(
+                source_index=3,
+                boxclass="text",
+                bbox=(0.0, 78.0, 260.0, 118.0),
+                textlines=[
+                    RawLayoutLine(bbox=(0.0, 78.0, 260.0, 98.0), spans=[_span("Proof. The key is:", x0=0.0, x1=90.0)]),
+                    RawLayoutLine(bbox=(0.0, 100.0, 260.0, 118.0), spans=[_span("Therefore x_i = 0.", x0=0.0, x1=100.0)]),
+                ],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert any(
+        region.source == RegionSource.FORMULA_BOX_SPLIT and region.kind == RegionKind.DISPLAY_MATH_BLOCK
+        for region in regions
+    )
+    assert all(
+        not (
+            region.source == RegionSource.FORMULA_BOX_SPLIT
+            and region.kind == RegionKind.DISPLAY_MATH_BLOCK
+            and any(segment.segment.boxes[0].bbox == (80.0, 60.0, 140.0, 74.0) for segment in region.segments if segment.segment.boxes)
+        )
+        for region in regions
+    )
 
 
 def test_build_page_regions_keeps_display_sized_formula_box_split() -> None:
@@ -820,6 +1020,50 @@ def test_serialize_page_with_region_promotion_keeps_theorem_proof_region_on_stab
     promoted = serialize_page_with_region_promotion(page)
 
     assert stable == promoted
+
+
+def test_should_use_region_serializer_rejects_display_math_next_to_caption() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 220.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 220.0, 20.0), spans=[_span("Figure 1: Overview.", x0=0.0, x1=100.0)])],
+            ),
+            RawLayoutBox(
+                source_index=1,
+                boxclass="text",
+                bbox=(80.0, 26.0, 220.0, 46.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(80.0, 26.0, 220.0, 46.0),
+                        spans=[
+                            _span("W", x0=80.0, x1=86.0),
+                            _span("∈", x0=90.0, x1=98.0),
+                            _span("R", x0=102.0, x1=108.0),
+                            _span("d×d", x0=110.0, x1=140.0),
+                        ],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+    assert len(regions) >= 2
+    assert regions[0].kind == RegionKind.CAPTION
+    assert regions[1].kind == RegionKind.DISPLAY_MATH_BLOCK
+    assert should_use_region_serializer(
+        regions[1],
+        page_width=page.width,
+        previous_context="Figure 1: Overview.",
+        previous_region_kind=regions[0].kind,
+        previous_region_source=regions[0].source,
+    ) is False
 
 
 def test_serialize_page_keeps_formula_region_between_prose_sections() -> None:
@@ -1100,3 +1344,155 @@ def test_build_region_review_report_includes_promotion_decisions() -> None:
     assert "lines: formula_box" in report
     assert "theorem_proof_block" in report
     assert "specialized: [[DISPLAY_FORMULA_BLOCK x2: case-definition]]" in report
+
+
+def test_build_paper_math_diagnostics_reports_region_and_suppression_counts() -> None:
+    document = RawLayoutDocument(
+        source_pdf="/tmp/sample.pdf",
+        page_count=2,
+        pages=[
+            RawLayoutPage(
+                page_number=1,
+                width=400.0,
+                height=600.0,
+                boxes=[
+                    RawLayoutBox(
+                        source_index=0,
+                        boxclass="text",
+                        bbox=(40.0, 0.0, 260.0, 24.0),
+                        textlines=[
+                            RawLayoutLine(
+                                bbox=(80.0, 0.0, 240.0, 20.0),
+                                spans=[
+                                    _span("Diederik", x0=80.0, x1=120.0),
+                                    _span("P.", x0=124.0, x1=136.0),
+                                    _span("Kingma", x0=140.0, x1=178.0),
+                                    _span("*", x0=182.0, x1=186.0, baseline=7.5, size=7.0, flags=1),
+                                ],
+                            )
+                        ],
+                    ),
+                    RawLayoutBox(
+                        source_index=1,
+                        boxclass="text",
+                        bbox=(80.0, 30.0, 240.0, 54.0),
+                        textlines=[
+                            RawLayoutLine(
+                                bbox=(120.0, 30.0, 210.0, 50.0),
+                                spans=[
+                                    _span("Discretize", x0=120.0, x1=170.0, baseline=40.0),
+                                    _span("∆", x0=176.0, x1=184.0, baseline=40.0),
+                                    _span("SRAMGPU", x0=184.5, x1=210.0, baseline=42.2, size=7.0),
+                                ],
+                            )
+                        ],
+                    ),
+                ],
+            ),
+            RawLayoutPage(
+                page_number=2,
+                width=400.0,
+                height=600.0,
+                boxes=[
+                    RawLayoutBox(
+                        source_index=0,
+                        boxclass="text",
+                        bbox=(0.0, 0.0, 180.0, 20.0),
+                        textlines=[
+                            RawLayoutLine(
+                                bbox=(0.0, 0.0, 180.0, 20.0),
+                                spans=[_span("When y < x1:", x0=0.0, x1=60.0)],
+                            )
+                        ],
+                    ),
+                    RawLayoutBox(source_index=1, boxclass="formula", bbox=(0.0, 22.0, 180.0, 40.0)),
+                    RawLayoutBox(source_index=2, boxclass="formula", bbox=(0.0, 44.0, 180.0, 60.0)),
+                ],
+            ),
+        ],
+    )
+
+    diagnostics = build_paper_math_diagnostics(document)
+
+    assert diagnostics.pages_evaluated == 2
+    assert diagnostics.display_math_regions == 1
+    assert diagnostics.promoted_regions == 1
+    assert diagnostics.fallback_regions == 0
+    assert diagnostics.formula_box_split_regions == 1
+    assert diagnostics.experimental_candidate_pages == 1
+    assert diagnostics.reference_like_pages == 0
+    assert diagnostics.figure_table_like_pages == 0
+    assert diagnostics.author_affiliation_suppressions >= 1
+    assert diagnostics.suspected_figure_label_suppressions >= 1
+
+
+def test_build_page_math_diagnostics_marks_bibliography_like_page_as_non_candidate() -> None:
+    page = RawLayoutPage(
+        page_number=7,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 360.0, 120.0),
+                textlines=[
+                    RawLayoutLine(bbox=(0.0, 0.0, 360.0, 18.0), spans=[_span("[1] Smith et al. In: Proceedings of XYZ.", x0=0.0, x1=220.0)]),
+                    RawLayoutLine(bbox=(0.0, 20.0, 360.0, 38.0), spans=[_span("[2] Doe et al. Journal of ABC, pp. 1-10.", x0=0.0, x1=240.0)]),
+                    RawLayoutLine(bbox=(0.0, 40.0, 360.0, 58.0), spans=[_span("[3] Roe et al. DOI 10.1000/test.", x0=0.0, x1=210.0)]),
+                    RawLayoutLine(bbox=(0.0, 60.0, 360.0, 78.0), spans=[_span("[4] Foo et al. arXiv 1234.5678.", x0=0.0, x1=180.0)]),
+                    RawLayoutLine(bbox=(0.0, 80.0, 360.0, 98.0), spans=[_span("[5] Bar et al. Conference on Things.", x0=0.0, x1=210.0)]),
+                    RawLayoutLine(bbox=(0.0, 100.0, 360.0, 118.0), spans=[_span("[6] Baz et al. ISBN 1234567890.", x0=0.0, x1=180.0)]),
+                ],
+            ),
+        ],
+    )
+
+    diagnostics = build_page_math_diagnostics(page)
+
+    assert diagnostics.reference_like is True
+    assert diagnostics.experimental_candidate is False
+    assert should_use_experimental_math_on_page(page) is False
+
+
+def test_build_page_math_diagnostics_marks_math_heavy_page_as_candidate() -> None:
+    page = RawLayoutPage(
+        page_number=12,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 220.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 220.0, 20.0), spans=[_span("Proof. The key is to consider y.", x0=0.0, x1=160.0)])],
+            ),
+            RawLayoutBox(
+                source_index=1,
+                boxclass="text",
+                bbox=(60.0, 24.0, 220.0, 44.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(60.0, 24.0, 220.0, 44.0),
+                        spans=[
+                            _span("r", x0=60.0, x1=64.0),
+                            _span("D", x0=64.2, x1=68.0, baseline=36.2, size=7.0),
+                            _span("[+][(]", x0=68.2, x1=80.0, baseline=31.7, size=7.0),
+                            _span("[y]", x0=80.2, x1=86.0, baseline=31.7, size=7.0),
+                            _span("[)]", x0=86.2, x1=92.0, baseline=31.7, size=7.0),
+                            _span("-ω", x0=96.0, x1=104.0),
+                            _span("D", x0=104.2, x1=108.0, baseline=36.2, size=7.0),
+                            _span("=[0]", x0=112.0, x1=126.0),
+                        ],
+                    ),
+                ],
+            ),
+            RawLayoutBox(source_index=2, boxclass="formula", bbox=(40.0, 48.0, 280.0, 80.0)),
+        ],
+    )
+
+    diagnostics = build_page_math_diagnostics(page)
+
+    assert diagnostics.experimental_candidate is True
+    assert diagnostics.reference_like is False
+    assert should_use_experimental_math_on_page(page) is True

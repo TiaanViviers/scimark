@@ -23,6 +23,15 @@ class AlgorithmRegion:
     label: str | None = None
 
 
+def _algorithm_number(label: str | None) -> int | None:
+    if label is None:
+        return None
+    match = re.search(r"\bAlgorithm\s+(\d+)\b", label)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def _normalize_line(line: str) -> str:
     normalized = re.sub(r"\*\*(.*?)\*\*", r"\1", line)
     normalized = re.sub(r"__(.*?)__", r"\1", normalized)
@@ -104,7 +113,29 @@ def find_algorithm_regions(markdown: str) -> list[AlgorithmRegion]:
             )
         )
 
-    return regions
+    filtered: list[AlgorithmRegion] = []
+    last_number = 0
+    for region in regions:
+        number = _algorithm_number(region.label)
+        if number is not None and number < last_number:
+            continue
+        if number is not None:
+            last_number = number
+        filtered.append(region)
+
+    merged: list[AlgorithmRegion] = []
+    for region in filtered:
+        if (
+            region.label is None
+            and merged
+            and merged[-1].label is not None
+            and region.start_line - merged[-1].end_line <= 6
+        ):
+            merged[-1].end_line = max(merged[-1].end_line, region.end_line)
+            continue
+        merged.append(region)
+
+    return merged
 
 
 def annotate_algorithm_blocks(markdown: str) -> tuple[str, int]:

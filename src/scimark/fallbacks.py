@@ -358,15 +358,42 @@ def apply_algorithm_fallbacks(
     if not regions:
         return markdown
 
+    unused_regions = list(regions)
+
+    def select_region(candidate: StructuralCandidate) -> AlgorithmRegion | None:
+        label_matches = [
+            region for region in unused_regions if candidate.label and region.label == candidate.label
+        ]
+        if label_matches:
+            chosen = min(
+                label_matches,
+                key=lambda region: abs(region.start_line - candidate.start_line),
+            )
+            unused_regions.remove(chosen)
+            return chosen
+        if not unused_regions:
+            return None
+        chosen = min(
+            unused_regions,
+            key=lambda region: abs(region.start_line - candidate.start_line),
+        )
+        unused_regions.remove(chosen)
+        return chosen
+
     replacements: list[tuple[int, int, str, StructuralCandidate]] = []
-    for index, (region, candidate) in enumerate(zip(regions, algorithm_candidates, strict=False)):
+    for candidate in algorithm_candidates:
+        region = select_region(candidate)
+        if region is None:
+            continue
         replace_start = region.start_line
         while replace_start > 0 and lines[replace_start - 1].strip().startswith("<!-- scimark:"):
             replace_start -= 1
 
         next_replace_start = len(lines)
-        if index + 1 < len(regions):
-            next_replace_start = regions[index + 1].start_line
+        if unused_regions:
+            later_regions = [next_region for next_region in unused_regions if next_region.start_line > region.start_line]
+            if later_regions:
+                next_replace_start = min(next_region.start_line for next_region in later_regions)
             while (
                 next_replace_start > 0
                 and lines[next_replace_start - 1].strip().startswith("<!-- scimark:")
@@ -440,4 +467,3 @@ def apply_table_fallbacks(
 
     output_lines.extend(lines[cursor:])
     return "\n".join(output_lines).rstrip() + "\n"
-

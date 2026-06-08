@@ -61,3 +61,48 @@ end
     assert rerun_count == 0
     assert annotated.startswith("<!-- scimark: low-confidence-algorithm -->")
     assert rerun.count("<!-- scimark: low-confidence-algorithm -->") == 1
+
+
+def test_find_algorithm_regions_drops_backward_numbered_false_positives() -> None:
+    markdown = """Algorithm 1: First
+Input: x
+
+Algorithm 2: Second
+Input: y
+
+Algorithm 3: Third
+Input: z
+
+Algorithm 2:
+
+Algorithm 4: Fourth
+Input: q
+
+Algorithm 2:
+"""
+
+    regions = find_algorithm_regions(markdown)
+
+    assert [region.label for region in regions] == [
+        "Algorithm 1",
+        "Algorithm 2",
+        "Algorithm 3",
+        "Algorithm 4",
+    ]
+
+
+def test_find_algorithm_regions_merges_unlabeled_continuation_into_previous_algorithm() -> None:
+    markdown = """Algorithm 3: Sparsity-aware Split Finding
+Input: I
+Input: d
+
+for k = 1 to m do
+end
+Output: Split and default directions
+"""
+
+    regions = find_algorithm_regions(markdown)
+
+    assert len(regions) == 1
+    assert regions[0].label == "Algorithm 3"
+    assert (regions[0].start_line, regions[0].end_line) == (0, 6)
