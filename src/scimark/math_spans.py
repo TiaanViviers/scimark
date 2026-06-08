@@ -160,6 +160,31 @@ class RegionKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class RegionSource(str, Enum):
+    INITIAL_GROUPING = "initial_grouping"
+    EMBEDDED_DISPLAY_RUN = "embedded_display_run"
+    FORMULA_BOX_SPLIT = "formula_box_split"
+
+
+class FormulaBoxKind(str, Enum):
+    INLINE_NOISE = "inline_noise"
+    DISPLAY_EQUATION = "display_equation"
+    CASE_DEFINITION = "case_definition"
+    CONSTRAINT_SET = "constraint_set"
+    DERIVATION_STEP = "derivation_step"
+    ALGORITHM_MATH = "algorithm_math"
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True)
+class FormulaBoxAnalysis:
+    kind: FormulaBoxKind
+    usefulness_score: float
+    should_standalone: bool
+    should_promote: bool
+    reasons: list[str] = field(default_factory=list)
+
+
 @dataclass(slots=True)
 class MathLine:
     text: str
@@ -186,6 +211,7 @@ class RegionBlock:
     segments: list[SegmentAnalysis] = field(default_factory=list)
     confidence: float = 0.0
     reasons: list[str] = field(default_factory=list)
+    source: RegionSource = RegionSource.INITIAL_GROUPING
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
@@ -195,6 +221,20 @@ class RegionBlock:
         x1 = max(box.bbox[2] for box in boxes)
         y1 = max(box.bbox[3] for box in boxes)
         return x0, y0, x1, y1
+
+
+@dataclass(slots=True)
+class LineRun:
+    start: int
+    end: int
+    confidence: float
+    reasons: list[str] = field(default_factory=list)
+    rejected_reasons: list[str] = field(default_factory=list)
+    lines: list[MathLine] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> bool:
+        return not self.rejected_reasons
 
 
 def _reference_baseline(spans: list[RawLayoutSpan]) -> float:
@@ -611,46 +651,7 @@ def _analyze_segment(segment: PageSegment, *, page_width: float) -> SegmentAnaly
                 )
 
     lines.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
-
-    if not lines:
-        return SegmentAnalysis(
-            segment=segment,
-            lines=[],
-            base_kind=RegionKind.DISPLAY_MATH_BLOCK if has_formula_boxes else RegionKind.UNKNOWN,
-            confidence=0.96 if has_formula_boxes else 0.0,
-            reasons=["formula_boxes"] if has_formula_boxes else ["empty"],
-            has_formula_boxes=has_formula_boxes,
-        )
-
-    first_kind = lines[0].classification.kind
-    first_text = lines[0].text
-    if has_formula_boxes and (first_kind == LineKind.THEOREM_PROOF or _line_starts_formula_context(first_text)):
-        base_kind = RegionKind.THEOREM_PROOF_BLOCK
-    elif first_kind == LineKind.THEOREM_PROOF:
-        base_kind = RegionKind.THEOREM_PROOF_BLOCK
-    elif all(line.classification.kind == LineKind.ALGORITHM for line in lines):
-        base_kind = RegionKind.ALGORITHM_BLOCK
-    elif all(line.classification.kind == LineKind.LIST for line in lines):
-        base_kind = RegionKind.LIST_BLOCK
-    elif lines[0].classification.kind == LineKind.CAPTION:
-        base_kind = RegionKind.CAPTION
-    elif all(line.classification.kind == LineKind.DISPLAY_MATH for line in lines):
-        base_kind = RegionKind.DISPLAY_MATH_BLOCK
-    elif any(line.classification.kind == LineKind.INLINE_MATH_PROSE for line in lines):
-        base_kind = RegionKind.INLINE_MATH_PROSE
-    elif all(line.classification.kind == LineKind.PROSE for line in lines):
-        base_kind = RegionKind.PROSE
-    else:
-        base_kind = _region_kind_from_line_kind(first_kind)
-
-    confidence = sum(line.classification.confidence for line in lines) / len(lines)
-    reasons: list[str] = []
-    seen: set[str] = set()
-    for line in lines:
-        for reason in line.classification.reasons:
-            if reason not in seen:
-                seen.add(reason)
-                reasons.append(reason)
+    base_kind, confidence, reasons = _classify_segment_lines(lines, has_formula_boxes=has_formula_boxes)
 
     return SegmentAnalysis(
         segment=segment,
@@ -1308,6 +1309,550 @@ def _segment_ends_formula_preface(segment: SegmentAnalysis) -> bool:
     return _line_starts_formula_context(segment.lines[-1].text)
 
 
+def _build_region_block(
+    kind: RegionKind,
+    segments: list[SegmentAnalysis],
+    *,
+    page_number: int,
+    source: RegionSource = RegionSource.INITIAL_GROUPING,
+) -> RegionBlock:
+    confidence = sum(segment.confidence for segment in segments) / len(segments) if segments else 0.0
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for segment in segments:
+        for reason in segment.reasons:
+            if reason not in seen:
+                seen.add(reason)
+                reasons.append(reason)
+    return RegionBlock(
+        page_number=page_number,
+        kind=kind,
+        segments=segments,
+        confidence=confidence,
+        reasons=reasons,
+        source=source,
+    )
+
+
+def _kind_for_line_chunk(lines: list[MathLine], fallback: RegionKind) -> RegionKind:
+    if not lines:
+        return fallback
+    kinds = {line.classification.kind for line in lines}
+    if kinds == {LineKind.DISPLAY_MATH}:
+        return RegionKind.DISPLAY_MATH_BLOCK
+    if LineKind.THEOREM_PROOF in kinds:
+        return RegionKind.THEOREM_PROOF_BLOCK
+    if LineKind.INLINE_MATH_PROSE in kinds:
+        return RegionKind.INLINE_MATH_PROSE
+    if kinds == {LineKind.PROSE}:
+        return RegionKind.PROSE
+    return fallback
+
+
+def _classify_segment_lines(lines: list[MathLine], *, has_formula_boxes: bool) -> tuple[RegionKind, float, list[str]]:
+    if not lines:
+        if has_formula_boxes:
+            return RegionKind.DISPLAY_MATH_BLOCK, 0.96, ["formula_boxes"]
+        return RegionKind.UNKNOWN, 0.0, ["empty"]
+
+    first_kind = lines[0].classification.kind
+    first_text = lines[0].text
+    if has_formula_boxes and (first_kind == LineKind.THEOREM_PROOF or _line_starts_formula_context(first_text)):
+        base_kind = RegionKind.THEOREM_PROOF_BLOCK
+    elif first_kind == LineKind.THEOREM_PROOF:
+        base_kind = RegionKind.THEOREM_PROOF_BLOCK
+    elif all(line.classification.kind == LineKind.ALGORITHM for line in lines):
+        base_kind = RegionKind.ALGORITHM_BLOCK
+    elif all(line.classification.kind == LineKind.LIST for line in lines):
+        base_kind = RegionKind.LIST_BLOCK
+    elif lines[0].classification.kind == LineKind.CAPTION:
+        base_kind = RegionKind.CAPTION
+    elif all(line.classification.kind == LineKind.DISPLAY_MATH for line in lines):
+        base_kind = RegionKind.DISPLAY_MATH_BLOCK
+    elif any(line.classification.kind == LineKind.INLINE_MATH_PROSE for line in lines):
+        base_kind = RegionKind.INLINE_MATH_PROSE
+    elif all(line.classification.kind == LineKind.PROSE for line in lines):
+        base_kind = RegionKind.PROSE
+    else:
+        base_kind = _region_kind_from_line_kind(first_kind)
+
+    confidence = sum(line.classification.confidence for line in lines) / len(lines)
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        for reason in line.classification.reasons:
+            if reason not in seen:
+                seen.add(reason)
+                reasons.append(reason)
+    return base_kind, confidence, reasons
+
+
+def _build_child_segment_analysis(
+    parent: SegmentAnalysis,
+    *,
+    boxes: list[RawLayoutBox],
+    lines: list[MathLine],
+    start_box_index: int,
+    end_box_index: int,
+    has_formula_boxes: bool,
+) -> SegmentAnalysis:
+    base_kind, confidence, reasons = _classify_segment_lines(lines, has_formula_boxes=has_formula_boxes)
+    return SegmentAnalysis(
+        segment=PageSegment(
+            page_number=parent.segment.page_number,
+            start_box_index=start_box_index,
+            end_box_index=end_box_index,
+            kind=parent.segment.kind,
+            boxes=boxes,
+        ),
+        lines=lines,
+        base_kind=base_kind,
+        confidence=confidence,
+        reasons=reasons,
+        has_formula_boxes=has_formula_boxes,
+    )
+
+
+def _split_segment_into_box_analyses(segment: SegmentAnalysis) -> list[SegmentAnalysis]:
+    if len(segment.segment.boxes) <= 1:
+        return [segment]
+
+    child_analyses: list[SegmentAnalysis] = []
+    local_box_index = 0
+    while local_box_index < len(segment.segment.boxes):
+        box = segment.segment.boxes[local_box_index]
+        if box.boxclass == "formula":
+            formula_boxes = [box]
+            start_local_index = local_box_index
+            local_box_index += 1
+            while local_box_index < len(segment.segment.boxes):
+                candidate = segment.segment.boxes[local_box_index]
+                if candidate.boxclass != "formula":
+                    break
+                formula_boxes.append(candidate)
+                local_box_index += 1
+            start_box_index = segment.segment.start_box_index + start_local_index
+            end_box_index = start_box_index + len(formula_boxes) - 1
+            child_analyses.append(
+                _build_child_segment_analysis(
+                    segment,
+                    boxes=formula_boxes,
+                    lines=[],
+                    start_box_index=start_box_index,
+                    end_box_index=end_box_index,
+                    has_formula_boxes=True,
+                )
+            )
+            continue
+
+        child_lines = [line for line in segment.lines if line.source_box_index == local_box_index]
+        if child_lines:
+            start_box_index = segment.segment.start_box_index + local_box_index
+            child_analyses.append(
+                _build_child_segment_analysis(
+                    segment,
+                    boxes=[box],
+                    lines=child_lines,
+                    start_box_index=start_box_index,
+                    end_box_index=start_box_index,
+                    has_formula_boxes=False,
+                )
+            )
+        local_box_index += 1
+    return child_analyses or [segment]
+
+
+def _is_sentence_fragment_display_line(line: MathLine) -> bool:
+    features = line.classification.features
+    if features is None:
+        return False
+    if re.search(r"\b(?:to|and|or|the|is|for|when|where|which means|we have|such)\b", line.text):
+        return True
+    if line.text.endswith("."):
+        return True
+    if features.prose_word_count >= 3:
+        return True
+    return False
+
+
+def _evaluate_display_run(lines: list[MathLine]) -> LineRun:
+    confidence = sum(line.classification.confidence for line in lines) / len(lines)
+    reasons: list[str] = []
+    seen: set[str] = set()
+    rejected_reasons: list[str] = []
+
+    for line in lines:
+        for reason in line.classification.reasons:
+            if reason not in seen:
+                seen.add(reason)
+                reasons.append(reason)
+
+    if any(line.classification.kind != LineKind.DISPLAY_MATH for line in lines):
+        rejected_reasons.append("non_display_math_line")
+    if any(_is_sentence_fragment_display_line(line) for line in lines):
+        rejected_reasons.append("sentence_fragment")
+    if len(lines) == 1 and confidence < 0.92:
+        rejected_reasons.append("single_line_confidence_below_threshold")
+    if len(lines) > 1 and confidence < 0.82:
+        rejected_reasons.append("run_confidence_below_threshold")
+
+    return LineRun(
+        start=0,
+        end=len(lines) - 1,
+        confidence=confidence,
+        reasons=reasons,
+        rejected_reasons=rejected_reasons,
+        lines=lines,
+    )
+
+
+def _find_display_math_runs_in_analysis(segment: SegmentAnalysis) -> list[LineRun]:
+    if segment.has_formula_boxes or not segment.lines:
+        return []
+
+    runs: list[LineRun] = []
+    current_lines: list[MathLine] = []
+    current_start = 0
+
+    def flush(end_index: int) -> None:
+        nonlocal current_lines, current_start
+        if not current_lines:
+            return
+        run = _evaluate_display_run(current_lines)
+        run.start = current_start
+        run.end = end_index
+        runs.append(run)
+        current_lines = []
+
+    for index, line in enumerate(segment.lines):
+        is_candidate = line.classification.kind in {LineKind.DISPLAY_MATH, LineKind.INLINE_MATH_PROSE}
+        if not is_candidate:
+            flush(index - 1)
+            continue
+        if not current_lines:
+            current_start = index
+            current_lines = [line]
+            continue
+        previous = current_lines[-1]
+        if index == current_start + len(current_lines) and abs(line.bbox[1] - previous.bbox[3]) <= 18:
+            current_lines.append(line)
+            continue
+        flush(index - 1)
+        current_start = index
+        current_lines = [line]
+
+    flush(len(segment.lines) - 1)
+    return runs
+
+
+def find_embedded_display_math_runs(segment: SegmentAnalysis) -> list[LineRun]:
+    runs: list[LineRun] = []
+    line_offset = 0
+    for child in _split_segment_into_box_analyses(segment):
+        if child.has_formula_boxes:
+            line_offset += len(child.lines)
+            continue
+        for run in _find_display_math_runs_in_analysis(child):
+            run.start += line_offset
+            run.end += line_offset
+            runs.append(run)
+        line_offset += len(child.lines)
+    return runs
+
+
+def _split_segment_by_display_math_runs(
+    segment: SegmentAnalysis,
+    *,
+    parent_kind: RegionKind,
+) -> list[SegmentAnalysis]:
+    if segment.has_formula_boxes or not segment.lines:
+        return [segment]
+    runs = [run for run in find_embedded_display_math_runs(segment) if run.accepted]
+    if not runs:
+        return [segment]
+
+    split_segments: list[SegmentAnalysis] = []
+    cursor = 0
+    for run in runs:
+        if run.start > cursor:
+            left_lines = segment.lines[cursor:run.start]
+            split_segments.append(
+                SegmentAnalysis(
+                    segment=segment.segment,
+                    lines=left_lines,
+                    base_kind=_kind_for_line_chunk(left_lines, parent_kind),
+                    confidence=sum(line.classification.confidence for line in left_lines) / len(left_lines),
+                    reasons=list({reason for line in left_lines for reason in line.classification.reasons}),
+                    has_formula_boxes=False,
+                )
+            )
+        run_lines = segment.lines[run.start : run.end + 1]
+        split_segments.append(
+            SegmentAnalysis(
+                segment=segment.segment,
+                lines=run_lines,
+                base_kind=RegionKind.DISPLAY_MATH_BLOCK,
+                confidence=run.confidence,
+                reasons=run.reasons,
+                has_formula_boxes=False,
+            )
+        )
+        cursor = run.end + 1
+
+    if cursor < len(segment.lines):
+        right_lines = segment.lines[cursor:]
+        split_segments.append(
+            SegmentAnalysis(
+                segment=segment.segment,
+                lines=right_lines,
+                base_kind=_kind_for_line_chunk(right_lines, parent_kind),
+                confidence=sum(line.classification.confidence for line in right_lines) / len(right_lines),
+                reasons=list({reason for line in right_lines for reason in line.classification.reasons}),
+                has_formula_boxes=False,
+            )
+        )
+
+    return [split for split in split_segments if split.lines] or [segment]
+
+
+def split_embedded_display_math_regions(regions: list[RegionBlock]) -> list[RegionBlock]:
+    split_regions: list[RegionBlock] = []
+
+    for region in regions:
+        if region.kind not in {RegionKind.THEOREM_PROOF_BLOCK, RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
+            split_regions.append(region)
+            continue
+
+        pending: list[SegmentAnalysis] = []
+
+        def flush_pending() -> None:
+            nonlocal pending
+            if not pending:
+                return
+            pending_kind = region.kind
+            if pending_kind not in {RegionKind.THEOREM_PROOF_BLOCK, RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
+                pending_kind = RegionKind.PROSE
+            split_regions.append(
+                _build_region_block(
+                    pending_kind,
+                    pending,
+                    page_number=region.page_number,
+                    source=region.source,
+                )
+            )
+            pending = []
+
+        for segment in region.segments:
+            for box_analysis in _split_segment_into_box_analyses(segment):
+                for chunk in _split_segment_by_display_math_runs(box_analysis, parent_kind=region.kind):
+                    if chunk.base_kind == RegionKind.DISPLAY_MATH_BLOCK:
+                        flush_pending()
+                        source = (
+                            RegionSource.FORMULA_BOX_SPLIT
+                            if chunk.has_formula_boxes
+                            else RegionSource.EMBEDDED_DISPLAY_RUN
+                        )
+                        split_regions.append(
+                            _build_region_block(
+                                RegionKind.DISPLAY_MATH_BLOCK,
+                                [chunk],
+                                page_number=region.page_number,
+                                source=source,
+                            )
+                        )
+                    else:
+                        pending.append(chunk)
+
+        flush_pending()
+
+    return split_regions
+
+
+def _formula_box_stub_kind(
+    region: RegionBlock,
+    *,
+    previous_context: str,
+    next_context: str,
+) -> str | None:
+    if not all(segment.has_formula_boxes for segment in region.segments):
+        return None
+    boxes = [box for segment in region.segments for box in segment.segment.boxes if box.boxclass == "formula"]
+    if not boxes:
+        return None
+    rendered = _render_formula_group_stub(boxes, before_text=previous_context, after_text=next_context)
+    match = re.fullmatch(r"\[\[DISPLAY_FORMULA(?:_BLOCK x\d+)?: ([^\]]+)\]\]", rendered)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def analyze_formula_box_region(
+    region: RegionBlock,
+    *,
+    page_width: float,
+    previous_context: str,
+    next_context: str,
+) -> FormulaBoxAnalysis:
+    if region.source != RegionSource.FORMULA_BOX_SPLIT:
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.UNKNOWN,
+            0.0,
+            True,
+            False,
+            ["not_formula_box_split"],
+        )
+    if region.kind != RegionKind.DISPLAY_MATH_BLOCK:
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.UNKNOWN,
+            0.0,
+            True,
+            False,
+            ["not_display_math_block"],
+        )
+    if not region.segments or not all(segment.has_formula_boxes for segment in region.segments):
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.UNKNOWN,
+            0.0,
+            True,
+            False,
+            ["non_formula_segments"],
+        )
+
+    boxes = [box for segment in region.segments for box in segment.segment.boxes if box.boxclass == "formula"]
+    if not boxes:
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.UNKNOWN,
+            0.0,
+            True,
+            False,
+            ["empty_formula_boxes"],
+        )
+
+    stub_kind = _formula_box_stub_kind(region, previous_context=previous_context, next_context=next_context)
+    max_width = max((box.bbox[2] - box.bbox[0] for box in boxes), default=0.0)
+    max_height = max((box.bbox[3] - box.bbox[1] for box in boxes), default=0.0)
+    width_ratio = max_width / page_width if page_width > 0 else 0.0
+    large_display = len(boxes) > 1 or max_height >= 24.0 or width_ratio >= 0.45
+    tiny_inline = len(boxes) == 1 and max_height < 24.0 and width_ratio < 0.42
+    reasons: list[str] = []
+
+    if large_display:
+        reasons.append("display_sized")
+    if tiny_inline:
+        reasons.append("tiny_box")
+    if len(boxes) > 1:
+        reasons.append("formula_box_run")
+
+    if stub_kind == "case-definition":
+        reasons.append("case_definition_stub")
+        return FormulaBoxAnalysis(FormulaBoxKind.CASE_DEFINITION, 0.95, True, True, reasons)
+    if stub_kind == "constraint":
+        reasons.append("constraint_stub")
+        return FormulaBoxAnalysis(FormulaBoxKind.CONSTRAINT_SET, 0.93, True, True, reasons)
+    if stub_kind == "algorithm-step":
+        reasons.append("algorithm_stub")
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.ALGORITHM_MATH,
+            0.78 if large_display else 0.62,
+            True,
+            False,
+            reasons,
+        )
+    if stub_kind and stub_kind.startswith("numbered-equation"):
+        reasons.append("numbered_equation")
+        return FormulaBoxAnalysis(FormulaBoxKind.DISPLAY_EQUATION, 0.9, True, True, reasons)
+    if stub_kind == "derivation":
+        reasons.append("derivation_stub")
+        return FormulaBoxAnalysis(
+            FormulaBoxKind.DERIVATION_STEP,
+            0.86 if large_display else 0.58,
+            True,
+            False,
+            reasons,
+        )
+    if stub_kind == "equation" and large_display:
+        reasons.append("equation_stub")
+        return FormulaBoxAnalysis(FormulaBoxKind.DISPLAY_EQUATION, 0.84, True, False, reasons)
+    if stub_kind == "equation" and tiny_inline:
+        reasons.extend(["equation_stub", "prose_neighbors"])
+        return FormulaBoxAnalysis(FormulaBoxKind.INLINE_NOISE, 0.2, False, False, reasons)
+    if tiny_inline:
+        reasons.append("prose_neighbors")
+        return FormulaBoxAnalysis(FormulaBoxKind.INLINE_NOISE, 0.25, False, False, reasons)
+    return FormulaBoxAnalysis(
+        FormulaBoxKind.UNKNOWN,
+        0.55 if large_display else 0.4,
+        True,
+        False,
+        reasons or ["context_dependent_formula"],
+    )
+
+
+def merge_low_value_formula_box_regions(regions: list[RegionBlock], *, page_width: float) -> list[RegionBlock]:
+    if not regions:
+        return []
+
+    merged: list[RegionBlock] = []
+
+    def fallback_text(region: RegionBlock) -> str:
+        return _serialize_region_block_stable(region, page_width=page_width)
+
+    index = 0
+    while index < len(regions):
+        region = regions[index]
+        previous_region = merged[-1] if merged else None
+        next_region = regions[index + 1] if index + 1 < len(regions) else None
+        previous_context = fallback_text(previous_region) if previous_region is not None else ""
+        next_context = fallback_text(next_region) if next_region is not None else ""
+        formula_analysis = analyze_formula_box_region(
+            region,
+            page_width=page_width,
+            previous_context=previous_context,
+            next_context=next_context,
+        )
+
+        if formula_analysis.should_standalone:
+            merged.append(region)
+            index += 1
+            continue
+
+        merged_into_previous = False
+        if previous_region is not None and previous_region.kind in {
+            RegionKind.THEOREM_PROOF_BLOCK,
+            RegionKind.PROSE,
+            RegionKind.INLINE_MATH_PROSE,
+        }:
+            merged[-1] = _build_region_block(
+                previous_region.kind,
+                previous_region.segments + region.segments,
+                page_number=previous_region.page_number,
+                source=previous_region.source,
+            )
+            merged_into_previous = True
+
+        if merged_into_previous:
+            index += 1
+            continue
+
+        if next_region is not None and next_region.kind in {
+            RegionKind.THEOREM_PROOF_BLOCK,
+            RegionKind.PROSE,
+            RegionKind.INLINE_MATH_PROSE,
+        }:
+            regions[index + 1] = _build_region_block(
+                next_region.kind,
+                region.segments + next_region.segments,
+                page_number=next_region.page_number,
+                source=next_region.source,
+            )
+        else:
+            merged.append(region)
+
+        index += 1
+
+    return merged
+
+
 def build_page_regions(page: RawLayoutPage) -> list[RegionBlock]:
     analyses = [_analyze_segment(segment, page_width=page.width) for segment in build_page_segments(page)]
     regions: list[RegionBlock] = []
@@ -1357,26 +1902,17 @@ def build_page_regions(page: RawLayoutPage) -> list[RegionBlock]:
                 grouped.append(analyses[index])
                 index += 1
 
-        confidence = sum(segment.confidence for segment in grouped) / len(grouped)
-        reasons: list[str] = []
-        seen: set[str] = set()
-        for segment in grouped:
-            for reason in segment.reasons:
-                if reason not in seen:
-                    seen.add(reason)
-                    reasons.append(reason)
-
         regions.append(
-            RegionBlock(
+            _build_region_block(
+                kind,
+                grouped,
                 page_number=page.page_number,
-                kind=kind,
-                segments=grouped,
-                confidence=confidence,
-                reasons=reasons,
+                source=RegionSource.INITIAL_GROUPING,
             )
         )
 
-    return regions
+    split_regions = split_embedded_display_math_regions(regions)
+    return merge_low_value_formula_box_regions(split_regions, page_width=page.width)
 
 
 def _serialize_lines_as_paragraph(lines: list[MathLine]) -> str:
@@ -1447,18 +1983,30 @@ def _serialize_segment_flow(
     return "\n\n".join(compacted).strip()
 
 
-def _serialize_display_math_block(region: RegionBlock, *, page_width: float) -> str:
+def _serialize_display_math_block(
+    region: RegionBlock,
+    *,
+    page_width: float,
+    previous_context: str = "",
+    next_context: str = "",
+) -> str:
     parts: list[str] = []
     for index, segment in enumerate(region.segments):
-        previous_context = parts[-1] if parts else ""
-        next_context = ""
+        segment_previous_context = parts[-1] if parts else previous_context
+        segment_next_context = next_context
         for later_segment in region.segments[index + 1 :]:
             later_lines = [line.text for line in later_segment.lines if line.text]
             if later_lines:
-                next_context = "\n".join(later_lines)
+                segment_next_context = "\n".join(later_lines)
                 break
         if segment.has_formula_boxes:
-            parts.append(_serialize_segment_flow(segment, previous_context=previous_context, next_context=next_context))
+            parts.append(
+                _serialize_segment_flow(
+                    segment,
+                    previous_context=segment_previous_context,
+                    next_context=segment_next_context,
+                )
+            )
         else:
             parts.append("\n".join(line.text for line in segment.lines if line.text))
     compacted: list[str] = []
@@ -1496,37 +2044,74 @@ def _serialize_theorem_proof_block(region: RegionBlock, *, page_width: float) ->
     return "\n\n".join(parts).strip()
 
 
-def should_use_region_serializer(region: RegionBlock) -> bool:
+def should_use_region_serializer(
+    region: RegionBlock,
+    *,
+    page_width: float | None = None,
+    previous_context: str = "",
+    next_context: str = "",
+) -> bool:
     if region.kind != RegionKind.DISPLAY_MATH_BLOCK:
         return False
     if region.confidence < 0.85:
         return False
+    if any(segment.has_formula_boxes for segment in region.segments):
+        if region.source != RegionSource.FORMULA_BOX_SPLIT or page_width is None:
+            return False
+        analysis = analyze_formula_box_region(
+            region,
+            page_width=page_width,
+            previous_context=previous_context,
+            next_context=next_context,
+        )
+        return analysis.should_promote
+    if region.source == RegionSource.FORMULA_BOX_SPLIT:
+        if page_width is None:
+            return False
+        analysis = analyze_formula_box_region(
+            region,
+            page_width=page_width,
+            previous_context=previous_context,
+            next_context=next_context,
+        )
+        return analysis.should_promote
 
     for segment in region.segments:
         if segment.has_formula_boxes:
             continue
         if segment.base_kind != RegionKind.DISPLAY_MATH_BLOCK:
             return False
-        if any(
-            line.classification.kind in {
+        for line in segment.lines:
+            if line.classification.kind in {
                 LineKind.THEOREM_PROOF,
                 LineKind.ALGORITHM,
                 LineKind.CAPTION,
                 LineKind.LIST,
                 LineKind.PROSE,
                 LineKind.INLINE_MATH_PROSE,
-            }
-            for line in segment.lines
-        ):
-            return False
+            }:
+                return False
+            if re.search(r"\b(?:to|and|or|the|is|for|when|where|such)\b", line.text):
+                return False
+            if line.text.endswith("."):
+                return False
 
     return True
 
 
 def _serialize_region_block_stable(region: RegionBlock, *, page_width: float) -> str:
     paragraphs: list[str] = []
-    for segment in region.segments:
+    for index, segment in enumerate(region.segments):
         if segment.has_formula_boxes:
+            previous_context = ""
+            next_context = ""
+            if paragraphs:
+                previous_context = paragraphs[-1]
+            for later_segment in region.segments[index + 1 :]:
+                later_lines = [line.text for line in later_segment.lines if line.text]
+                if later_lines:
+                    next_context = "\n".join(later_lines)
+                    break
             rendered = _serialize_math_region_for_page(
                 MathRegion(
                     page_number=segment.segment.page_number,
@@ -1534,8 +2119,8 @@ def _serialize_region_block_stable(region: RegionBlock, *, page_width: float) ->
                     end_box_index=segment.segment.end_box_index,
                     boxes=segment.segment.boxes,
                 ),
-                previous_context="",
-                next_context="",
+                previous_context=previous_context,
+                next_context=next_context,
                 page_width=page_width,
             )
         else:
@@ -1547,9 +2132,20 @@ def _serialize_region_block_stable(region: RegionBlock, *, page_width: float) ->
     return "\n\n".join(paragraphs).strip()
 
 
-def serialize_region_block(region: RegionBlock, *, page_width: float) -> str:
+def serialize_region_block(
+    region: RegionBlock,
+    *,
+    page_width: float,
+    previous_context: str = "",
+    next_context: str = "",
+) -> str:
     if region.kind == RegionKind.DISPLAY_MATH_BLOCK:
-        return _serialize_display_math_block(region, page_width=page_width)
+        return _serialize_display_math_block(
+            region,
+            page_width=page_width,
+            previous_context=previous_context,
+            next_context=next_context,
+        )
     if region.kind == RegionKind.THEOREM_PROOF_BLOCK:
         return _serialize_theorem_proof_block(region, page_width=page_width)
     if region.kind in {RegionKind.PROSE, RegionKind.INLINE_MATH_PROSE}:
@@ -1576,12 +2172,36 @@ def build_region_review_report(document: RawLayoutDocument) -> str:
             lines.append("  no regions")
             lines.append("")
             continue
+        stable_texts = [_serialize_region_block_stable(region, page_width=page.width) for region in regions]
 
         for index, region in enumerate(regions):
-            use_specialized = should_use_region_serializer(region)
+            previous_context = ""
+            next_context = ""
+            for earlier in reversed(stable_texts[:index]):
+                if earlier:
+                    previous_context = earlier
+                    break
+            for later in stable_texts[index + 1 :]:
+                if later:
+                    next_context = later
+                    break
+            formula_analysis = None
+            if region.source == RegionSource.FORMULA_BOX_SPLIT:
+                formula_analysis = analyze_formula_box_region(
+                    region,
+                    page_width=page.width,
+                    previous_context=previous_context,
+                    next_context=next_context,
+                )
+            use_specialized = should_use_region_serializer(
+                region,
+                page_width=page.width,
+                previous_context=previous_context,
+                next_context=next_context,
+            )
             lines.append(
                 "  "
-                f"REGION {index} | {region.kind.value} | confidence={region.confidence:.2f} | "
+                f"REGION {index} | {region.kind.value} | source={region.source.value} | confidence={region.confidence:.2f} | "
                 f"{'specialized=yes' if use_specialized else 'fallback=stable'}"
             )
             if region.reasons:
@@ -1594,10 +2214,35 @@ def build_region_review_report(document: RawLayoutDocument) -> str:
                     line_kinds.extend(line.classification.kind.value for line in segment.lines)
             if line_kinds:
                 lines.append(f"    lines: {', '.join(line_kinds)}")
-            stable = _serialize_region_block_stable(region, page_width=page.width)
+            if formula_analysis is not None:
+                lines.append(
+                    "    "
+                    f"formula_kind={formula_analysis.kind.value} usefulness={formula_analysis.usefulness_score:.2f} "
+                    f"standalone={'yes' if formula_analysis.should_standalone else 'no'} "
+                    f"promote={'yes' if formula_analysis.should_promote else 'no'}"
+                )
+                if formula_analysis.reasons:
+                    lines.append(f"      formula_reasons: {', '.join(formula_analysis.reasons)}")
+            for segment in region.segments:
+                runs = find_embedded_display_math_runs(segment)
+                for run_index, run in enumerate(runs):
+                    status = "accepted" if run.accepted else "rejected"
+                    details = ", ".join(run.rejected_reasons) if run.rejected_reasons else ", ".join(run.reasons)
+                    lines.append(
+                        "    "
+                        f"run {run_index}: lines={run.start}-{run.end} conf={run.confidence:.2f} {status}"
+                    )
+                    if details:
+                        lines.append(f"      reasons: {details}")
+            stable = stable_texts[index]
             lines.append(f"    stable: {stable}" if stable else "    stable: <empty>")
             if use_specialized:
-                specialized = serialize_region_block(region, page_width=page.width)
+                specialized = serialize_region_block(
+                    region,
+                    page_width=page.width,
+                    previous_context=previous_context,
+                    next_context=next_context,
+                )
                 lines.append(f"    specialized: {specialized}" if specialized else "    specialized: <empty>")
         lines.append("")
 
@@ -1629,6 +2274,43 @@ def serialize_page(page: RawLayoutPage) -> str:
             )
         else:
             text = _serialize_prose_boxes(segment.boxes, page_width=page.width)
+        if not text:
+            continue
+        if rendered and _is_standalone_equation_number_text(text) and _ends_with_numbered_formula_stub(rendered[-1]):
+            continue
+        if rendered:
+            rendered.append("\n\n")
+        rendered.append(text)
+
+    return _normalize_surface_text("".join(rendered).strip())
+
+
+def serialize_page_with_region_promotion(page: RawLayoutPage) -> str:
+    regions = build_page_regions(page)
+    stable_texts = [_serialize_region_block_stable(region, page_width=page.width) for region in regions]
+    rendered: list[str] = []
+
+    for index, region in enumerate(regions):
+        previous_context = rendered[-1] if rendered else ""
+        next_context = ""
+        for later_text in stable_texts[index + 1 :]:
+            if later_text:
+                next_context = later_text
+                break
+        if should_use_region_serializer(
+            region,
+            page_width=page.width,
+            previous_context=previous_context,
+            next_context=next_context,
+        ):
+            text = serialize_region_block(
+                region,
+                page_width=page.width,
+                previous_context=previous_context,
+                next_context=next_context,
+            )
+        else:
+            text = stable_texts[index]
         if not text:
             continue
         if rendered and _is_standalone_equation_number_text(text) and _ends_with_numbered_formula_stub(rendered[-1]):

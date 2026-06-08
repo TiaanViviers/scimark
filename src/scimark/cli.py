@@ -7,7 +7,12 @@ from pathlib import Path
 
 from scimark.converter import ConvertOptions, convert_input
 from scimark.layout import extract_raw_layout_document, parse_page_spec
-from scimark.math_spans import build_math_debug_report, build_region_review_report, serialize_page
+from scimark.math_spans import (
+    build_math_debug_report,
+    build_region_review_report,
+    serialize_page,
+    serialize_page_with_region_promotion,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
     prototype_math_parser.add_argument("pdf_path", help="PDF file to inspect.")
     prototype_math_parser.add_argument("--out", required=True, help="Text file to write.")
     prototype_math_parser.add_argument(
+        "--pages",
+        help="1-based page selection like '12' or '12-14,18'. Defaults to all pages.",
+    )
+
+    promoted_prototype_math_parser = subparsers.add_parser(
+        "prototype-math-promoted",
+        help="Render the prototype using conservative region-level promotion for high-confidence display-math blocks.",
+    )
+    promoted_prototype_math_parser.add_argument("pdf_path", help="PDF file to inspect.")
+    promoted_prototype_math_parser.add_argument("--out", required=True, help="Text file to write.")
+    promoted_prototype_math_parser.add_argument(
         "--pages",
         help="1-based page selection like '12' or '12-14,18'. Defaults to all pages.",
     )
@@ -169,6 +185,23 @@ def main(argv: list[str] | None = None) -> int:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("".join(page_text).rstrip() + "\n", encoding="utf-8")
             print(f"Wrote math prototype: {output_path.resolve()}")
+            return 0
+
+        if args.command == "prototype-math-promoted":
+            page_selection = parse_page_spec(args.pages)
+            layout_document = extract_raw_layout_document(Path(args.pdf_path), pages=page_selection)
+            page_text = []
+            for page in layout_document.pages:
+                serialized = serialize_page_with_region_promotion(page)
+                page_text.append(f"page {page.page_number}\n")
+                if serialized:
+                    page_text.append(serialized)
+                    page_text.append("\n")
+                page_text.append("\n")
+            output_path = Path(args.out)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("".join(page_text).rstrip() + "\n", encoding="utf-8")
+            print(f"Wrote promoted math prototype: {output_path.resolve()}")
             return 0
 
         if args.command == "debug-regions":

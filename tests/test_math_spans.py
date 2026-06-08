@@ -1,19 +1,27 @@
 from scimark.layout import RawLayoutBox, RawLayoutDocument, RawLayoutLine, RawLayoutPage, RawLayoutSpan
 from scimark.math_spans import (
+    FormulaBoxKind,
     LineKind,
+    LineRun,
     MathRegion,
     RegionKind,
+    RegionBlock,
+    RegionSource,
+    SegmentAnalysis,
+    analyze_formula_box_region,
     build_math_debug_report,
     build_page_regions,
     build_region_review_report,
     build_page_segments,
     classify_line,
     extract_line_features,
+    find_embedded_display_math_runs,
     find_math_regions,
     is_math_like_box,
     normalize_span_token,
     serialize_display_math_line,
     serialize_page,
+    serialize_page_with_region_promotion,
     serialize_region_block,
     serialize_region,
     serialize_line,
@@ -452,12 +460,192 @@ def test_build_page_regions_groups_proof_display_and_followup_prose() -> None:
 
     regions = build_page_regions(page)
 
-    assert len(regions) == 1
     assert regions[0].kind == RegionKind.THEOREM_PROOF_BLOCK
-    rendered = serialize_region_block(regions[0], page_width=page.width)
+    assert any(region.kind == RegionKind.DISPLAY_MATH_BLOCK for region in regions)
+    rendered = "\n\n".join(serialize_region_block(region, page_width=page.width) for region in regions)
     assert "Proof. The key is:" in rendered
     assert "[[DISPLAY_FORMULA:" in rendered
     assert "Therefore x_i=0." in rendered
+
+
+def test_build_page_regions_splits_embedded_display_math_run_from_mixed_region() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 240.0, 80.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(0.0, 0.0, 220.0, 20.0),
+                        spans=[_span("Proof. The key is to consider y.", x0=0.0, x1=160.0)],
+                    ),
+                    RawLayoutLine(
+                        bbox=(60.0, 24.0, 220.0, 44.0),
+                        spans=[
+                            _span("r", x0=60.0, x1=64.0),
+                            _span("D", x0=64.2, x1=68.0, baseline=36.2, size=7.0),
+                            _span("[+][(]", x0=68.2, x1=80.0, baseline=31.7, size=7.0),
+                            _span("[y]", x0=80.2, x1=86.0, baseline=31.7, size=7.0),
+                            _span("[)]", x0=86.2, x1=92.0, baseline=31.7, size=7.0),
+                            _span("-ω", x0=96.0, x1=104.0),
+                            _span("D", x0=104.2, x1=108.0, baseline=36.2, size=7.0),
+                            _span("=[0]", x0=112.0, x1=126.0),
+                        ],
+                    ),
+                    RawLayoutLine(
+                        bbox=(0.0, 48.0, 220.0, 68.0),
+                        spans=[_span("Therefore x_i = 0.", x0=0.0, x1=90.0)],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert [region.kind for region in regions] == [
+        RegionKind.THEOREM_PROOF_BLOCK,
+        RegionKind.DISPLAY_MATH_BLOCK,
+        RegionKind.THEOREM_PROOF_BLOCK,
+    ]
+    assert should_use_region_serializer(regions[1], page_width=page.width) is True
+    assert should_use_region_serializer(regions[0]) is False
+    assert should_use_region_serializer(regions[2]) is False
+
+
+def test_build_page_regions_splits_embedded_display_math_run_from_formula_mixed_region() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 220.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 220.0, 20.0), spans=[_span("Proof. The key is:", x0=0.0, x1=90.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(40.0, 24.0, 280.0, 56.0)),
+            RawLayoutBox(
+                source_index=2,
+                boxclass="text",
+                bbox=(0.0, 42.0, 260.0, 86.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(60.0, 42.0, 220.0, 62.0),
+                        spans=[
+                            _span("r", x0=60.0, x1=64.0),
+                            _span("D", x0=64.2, x1=68.0, baseline=54.2, size=7.0),
+                            _span("[+][(]", x0=68.2, x1=80.0, baseline=49.7, size=7.0),
+                            _span("[y]", x0=80.2, x1=86.0, baseline=49.7, size=7.0),
+                            _span("[)]", x0=86.2, x1=92.0, baseline=49.7, size=7.0),
+                            _span("-ω", x0=96.0, x1=104.0),
+                            _span("D", x0=104.2, x1=108.0, baseline=54.2, size=7.0),
+                            _span("=[0]", x0=112.0, x1=126.0),
+                        ],
+                    ),
+                    RawLayoutLine(
+                        bbox=(0.0, 66.0, 220.0, 86.0),
+                        spans=[_span("This means x_i = 0.", x0=0.0, x1=110.0)],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert regions[0].kind == RegionKind.THEOREM_PROOF_BLOCK
+    assert any(region.source == RegionSource.FORMULA_BOX_SPLIT for region in regions)
+
+
+def test_build_page_regions_merges_back_low_value_formula_box_split() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 220.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 220.0, 20.0), spans=[_span("Proof. The key is:", x0=0.0, x1=90.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(80.0, 24.0, 140.0, 38.0)),
+            RawLayoutBox(
+                source_index=2,
+                boxclass="text",
+                bbox=(0.0, 42.0, 220.0, 62.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 42.0, 220.0, 62.0), spans=[_span("Therefore x_i = 0.", x0=0.0, x1=100.0)])],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert all(region.source != RegionSource.FORMULA_BOX_SPLIT for region in regions)
+    assert len(regions) == 1
+    assert regions[0].kind == RegionKind.THEOREM_PROOF_BLOCK
+
+
+def test_build_page_regions_keeps_display_sized_formula_box_split() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 220.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 220.0, 20.0), spans=[_span("Proof. The key is:", x0=0.0, x1=90.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(40.0, 24.0, 280.0, 56.0)),
+            RawLayoutBox(
+                source_index=2,
+                boxclass="text",
+                bbox=(0.0, 60.0, 220.0, 80.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 60.0, 220.0, 80.0), spans=[_span("Therefore x_i = 0.", x0=0.0, x1=100.0)])],
+            ),
+        ],
+    )
+
+    regions = build_page_regions(page)
+
+    assert any(region.source == RegionSource.FORMULA_BOX_SPLIT for region in regions)
+    assert any(region.kind == RegionKind.DISPLAY_MATH_BLOCK for region in regions)
+
+
+def test_find_embedded_display_math_runs_reports_rejected_sentence_fragment() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 240.0, 40.0),
+                textlines=[
+                    RawLayoutLine(
+                        bbox=(60.0, 0.0, 220.0, 20.0),
+                        spans=[_span("ϵ to ϵ+^1_b.", x0=60.0, x1=140.0)],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    segment = build_page_regions(page)[0].segments[0]
+    runs = find_embedded_display_math_runs(segment)
+
+    assert len(runs) == 1
+    assert runs[0].accepted is False
+    assert "sentence_fragment" in runs[0].rejected_reasons
 
 
 def test_should_use_region_serializer_only_promotes_high_confidence_display_math() -> None:
@@ -489,9 +677,149 @@ def test_should_use_region_serializer_only_promotes_high_confidence_display_math
     proof_region = build_page_regions(proof_page)[0]
 
     assert display_region.kind == RegionKind.DISPLAY_MATH_BLOCK
-    assert should_use_region_serializer(display_region) is True
+    assert should_use_region_serializer(display_region, page_width=display_page.width) is False
     assert proof_region.kind == RegionKind.THEOREM_PROOF_BLOCK
     assert should_use_region_serializer(proof_region) is False
+
+
+def test_analyze_formula_box_region_classifies_case_definition_as_useful() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 120.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 120.0, 20.0), spans=[_span("When y < x1:", x0=0.0, x1=60.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(0.0, 22.0, 140.0, 36.0)),
+        ],
+    )
+
+    region = build_page_regions(page)[1]
+    analysis = analyze_formula_box_region(
+        region,
+        page_width=page.width,
+        previous_context="When y < x1:",
+        next_context="",
+    )
+
+    assert analysis.kind == FormulaBoxKind.CASE_DEFINITION
+    assert analysis.should_standalone is True
+    assert analysis.should_promote is True
+
+
+def test_analyze_formula_box_region_classifies_tiny_equation_as_inline_noise() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 120.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 120.0, 20.0), spans=[_span("Proof. The key is:", x0=0.0, x1=90.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(80.0, 24.0, 140.0, 38.0)),
+            RawLayoutBox(
+                source_index=2,
+                boxclass="text",
+                bbox=(0.0, 42.0, 220.0, 62.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 42.0, 220.0, 62.0), spans=[_span("Therefore x_i = 0.", x0=0.0, x1=100.0)])],
+            ),
+        ],
+    )
+
+    split_region = build_page_regions(page)[0]
+    formula_segment = next(segment for segment in split_region.segments if segment.has_formula_boxes)
+    analysis = analyze_formula_box_region(
+        RegionBlock(
+            page_number=1,
+            kind=RegionKind.DISPLAY_MATH_BLOCK,
+            segments=[
+                SegmentAnalysis(
+                    segment=formula_segment.segment,
+                    lines=[],
+                    base_kind=RegionKind.DISPLAY_MATH_BLOCK,
+                    confidence=0.96,
+                    reasons=["formula_boxes"],
+                    has_formula_boxes=True,
+                )
+            ],
+            source=RegionSource.FORMULA_BOX_SPLIT,
+        ),
+        page_width=page.width,
+        previous_context="Proof. The key is:",
+        next_context="Therefore x_i=0.",
+    )
+
+    assert analysis.kind == FormulaBoxKind.INLINE_NOISE
+    assert analysis.should_standalone is False
+    assert analysis.should_promote is False
+
+
+def test_serialize_page_with_region_promotion_promotes_safe_display_math_region() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(source_index=0, boxclass="formula", bbox=(80.0, 0.0, 320.0, 18.0)),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(80.0, 20.0, 320.0, 38.0)),
+        ],
+    )
+
+    stable = serialize_page(page)
+    promoted = serialize_page_with_region_promotion(page)
+
+    assert stable == "[[DISPLAY_FORMULA_BLOCK x2: derivation]]"
+    assert promoted == "[[DISPLAY_FORMULA_BLOCK x2: derivation]]"
+
+
+def test_should_use_region_serializer_rejects_sentence_fragment_display_math() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(80.0, 0.0, 260.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(80.0, 0.0, 260.0, 20.0), spans=[_span("ϵ to ϵ+^1_b.", x0=80.0, x1=180.0)])],
+            ),
+        ],
+    )
+
+    region = build_page_regions(page)[0]
+
+    assert region.kind == RegionKind.DISPLAY_MATH_BLOCK
+    assert should_use_region_serializer(region) is False
+
+
+def test_serialize_page_with_region_promotion_keeps_theorem_proof_region_on_stable_path() -> None:
+    page = RawLayoutPage(
+        page_number=1,
+        width=400.0,
+        height=600.0,
+        boxes=[
+            RawLayoutBox(
+                source_index=0,
+                boxclass="text",
+                bbox=(0.0, 0.0, 120.0, 20.0),
+                textlines=[RawLayoutLine(bbox=(0.0, 0.0, 120.0, 20.0), spans=[_span("When y < x1:", x0=0.0, x1=60.0)])],
+            ),
+            RawLayoutBox(source_index=1, boxclass="formula", bbox=(0.0, 22.0, 140.0, 36.0)),
+        ],
+    )
+
+    stable = serialize_page(page)
+    promoted = serialize_page_with_region_promotion(page)
+
+    assert stable == promoted
 
 
 def test_serialize_page_keeps_formula_region_between_prose_sections() -> None:
@@ -765,7 +1093,10 @@ def test_build_region_review_report_includes_promotion_decisions() -> None:
 
     assert "scimark region review" in report
     assert "REGION 0" in report
+    assert "source=initial_grouping" in report
     assert "fallback=stable" in report
     assert "stable:" in report
-    assert "lines: prose, formula_box" in report
+    assert "lines: prose" in report
+    assert "lines: formula_box" in report
     assert "theorem_proof_block" in report
+    assert "specialized: [[DISPLAY_FORMULA_BLOCK x2: case-definition]]" in report
