@@ -31,6 +31,18 @@ Convert recursively:
 scimark convert resources/ --out parsed/ --recursive
 ```
 
+Dump raw layout data for selected pages:
+
+```bash
+scimark dump-layout resources/XGboost.pdf --pages 12-13 --out /tmp/xgboost-layout.json
+```
+
+Write a math/span debug report for selected pages:
+
+```bash
+scimark debug-math resources/XGboost.pdf --pages 12-13 --out /tmp/xgboost-math.txt
+```
+
 Optional flags:
 
 - `--overwrite` replaces existing Markdown outputs.
@@ -38,6 +50,7 @@ Optional flags:
 - `--keep-raw` stores raw backend Markdown under `_scimark/raw/`.
 - `--no-strip-picture-text` keeps picture-text blocks.
 - `--no-strip-page-numbers` keeps standalone numeric page lines.
+- `debug-math --all-boxes` includes non-math-like boxes in the report.
 
 ## Output Layout
 
@@ -70,6 +83,13 @@ The first version keeps the pipeline intentionally small:
 4. Detect Markdown tables, compute simple confidence metrics, and mark low-confidence tables.
 5. Detect suspicious math-corrupted paragraphs and mark them for review.
 6. Normalize image links and write `manifest.json` plus `report.json`.
+
+## Math Workbench
+
+`scimark` now includes an experimental math workbench for inspecting raw `pymupdf4llm` layout data before it gets flattened into Markdown. This is the foundation for future inline-math recovery and later LaTeX-style emission.
+
+- `dump-layout` writes structured page / box / line / span JSON.
+- `debug-math` writes a human-readable report with prototype span-based math serialization, span baselines, sizes, and inferred subscript / superscript roles.
 
 ## Testing
 
